@@ -1,0 +1,9 @@
+{
+  "commands": [
+    "help",
+    "status",
+    "players",
+    "list",
+    "say"
+  ]
+}

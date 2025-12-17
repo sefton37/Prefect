@@ -18,6 +18,21 @@ def _build_server():
 
     mcp = FastMCP("prefect-necesse")
 
+    # Dynamically create one tool per configured command.
+    # Each tool takes a single free-form args string (kept small by sanitizer limits).
+    for cmd in core.command_names:
+        tool_name = f"prefect.cmd.{cmd}"
+
+        def _make(cmd_name: str):
+            @mcp.tool(name=f"prefect.cmd.{cmd_name}")
+            def _tool(args: str = "") -> dict:
+                full = cmd_name if not args.strip() else f"{cmd_name} {args.strip()}"
+                return core.run_command(full)
+
+            return _tool
+
+        _make(cmd)
+
     @mcp.tool(name="prefect.get_status")
     def get_status() -> dict:
         return core.get_status()

@@ -18,18 +18,18 @@ class CommandAllowlist:
     prefixes: tuple[str, ...]
 
     @staticmethod
-    def default() -> "CommandAllowlist":
+    def default(*, extra_prefixes: tuple[str, ...] = ()) -> "CommandAllowlist":
         # Keep Phase-1 conservative. Expand later as you learn Necesse console commands.
-        return CommandAllowlist(
-            prefixes=(
-                "help",
-                "?",
-                "say ",
-                "players",
-                "list",
-                "status",
-            )
+        base = (
+            "help",
+            "?",
+            "say ",
+            "players",
+            "list",
+            "status",
         )
+        merged = tuple(dict.fromkeys(base + tuple(extra_prefixes)))
+        return CommandAllowlist(prefixes=merged)
 
     def is_allowed(self, command: str) -> bool:
         normalized = command.lstrip()

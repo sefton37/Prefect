@@ -6,6 +6,7 @@ import time
 from dataclasses import asdict
 
 from prefect.config import PrefectSettings, get_settings
+from prefect.command_catalog import load_command_names
 from prefect.ollama_client import OllamaClient, OllamaConfig
 from prefect.safety.allowlist import CommandAllowlist, CommandNotPermittedError
 from prefect.safety.sanitizer import (
@@ -26,6 +27,8 @@ logger = logging.getLogger(__name__)
 class PrefectCore:
     def __init__(self, settings: PrefectSettings | None = None):
         self.settings = settings or get_settings()
+
+        self.command_names = load_command_names(self.settings.commands_file)
 
         self.log_buffer = RollingLogBuffer(max_lines=self.settings.log_buffer_lines)
 
@@ -48,7 +51,14 @@ class PrefectCore:
 
         self.command_runner = CommandRunner(self.controller)
 
-        self.allowlist = CommandAllowlist.default()
+        # Convert command names into safe allowlist prefixes.
+        # For single-word commands like "help" allow exact match; for arg commands, allow "cmd " prefix.
+        extra_prefixes: list[str] = []
+        for name in self.command_names:
+            extra_prefixes.append(name)
+            extra_prefixes.append(name + " ")
+
+        self.allowlist = CommandAllowlist.default(extra_prefixes=tuple(extra_prefixes))
         self.ollama = OllamaClient(OllamaConfig(base_url=self.settings.ollama_url, model=self.settings.model))
 
         self._started = False

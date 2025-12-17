@@ -11,6 +11,7 @@ class PrefectSettings(BaseSettings):
 
     server_root: Path = Field(default=Path("/home/kellogg/necesse-server"))
     log_path: Path | None = Field(default=None)
+    commands_file: Path | None = Field(default=Path("commands.json"))
 
     ollama_url: str = Field(default="http://127.0.0.1:11434")
     model: str = Field(default="llama3.1")

@@ -61,6 +61,17 @@ If you want Prefect to manage the Necesse server process, ensure your server dir
 - `prefect.announce(message: str)` -> dict `{ "ok": bool, "sent": bool }`
 - `prefect.summarize_recent_logs(n: int = 50)` -> dict `{ "ok": bool, "summary": str }`
 
+### Server command tools
+Prefect also auto-registers one MCP tool per server command listed in `commands.json`:
+- `prefect.cmd.<command>(args: str = "")`
+
+Example (if `commands.json` contains `"ban"`):
+- call `prefect.cmd.ban(args="PlayerName")`
+
+To add more commands, edit `commands.json` and restart Prefect.
+
+Safety note: Prefect is built for legitimate server administration. It does not include or document cheats/exploit tooling.
+
 ## Safety model
 - Default deny for commands.
 - Strict input sanitization disallows shell metacharacters and chaining.
