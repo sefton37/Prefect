@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
 import time
 from dataclasses import asdict
 
@@ -24,6 +26,18 @@ from prefect.watchers.log_tail import RollingLogBuffer
 logger = logging.getLogger(__name__)
 
 
+_DISALLOWED_FOR_ANNOUNCE = set(";|&><$`\\")
+
+
+def _coerce_safe_chat_text(text: str, *, max_len: int) -> str:
+    value = (text or "").replace("\n", " ").replace("\r", " ")
+    value = "".join(ch for ch in value if ch not in _DISALLOWED_FOR_ANNOUNCE)
+    value = " ".join(value.split())
+    if len(value) > max_len:
+        value = value[: max_len - 1].rstrip() + "…"
+    return value
+
+
 class PrefectCore:
     def __init__(self, settings: PrefectSettings | None = None):
         self.settings = settings or get_settings()
@@ -37,6 +51,8 @@ class PrefectCore:
             log_buffer=self.log_buffer,
             command_output_window_seconds=self.settings.command_output_window_seconds,
             log_path=self.settings.log_path,
+            on_chat_mention=self._on_chat_mention if self.settings.chat_mention_enabled else None,
+            chat_keyword=self.settings.chat_mention_keyword,
         )
 
         mode = (self.settings.control_mode or "managed").lower()
@@ -64,6 +80,11 @@ class PrefectCore:
         self._started = False
         self._start_time = time.time()
 
+        self._chat_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._chat_thread: threading.Thread | None = None
+        self._chat_stop = threading.Event()
+        self._last_player_reply_ts: dict[str, float] = {}
+
     def start(self) -> None:
         if self._started:
             return
@@ -85,6 +106,70 @@ class PrefectCore:
             except Exception as exc:
                 # Keep running so log-only mode can still work (e.g., if log_path is set).
                 logger.error("Failed to start Necesse server process: %s", exc)
+
+        if self.settings.chat_mention_enabled:
+            self._start_chat_thread()
+
+    def _start_chat_thread(self) -> None:
+        if self._chat_thread and self._chat_thread.is_alive():
+            return
+        self._chat_stop.clear()
+        self._chat_thread = threading.Thread(target=self._chat_worker, name="prefect-chat-worker", daemon=True)
+        self._chat_thread.start()
+
+    def _on_chat_mention(self, player: str, message: str) -> None:
+        # Called from stdout reader thread.
+        try:
+            self._chat_queue.put_nowait((player, message))
+        except Exception:
+            pass
+
+    def _chat_worker(self) -> None:
+        while not self._chat_stop.is_set():
+            try:
+                player, message = self._chat_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
+            now = time.time()
+            last = self._last_player_reply_ts.get(player.lower(), 0.0)
+            if now - last < float(self.settings.chat_cooldown_seconds):
+                continue
+
+            self._last_player_reply_ts[player.lower()] = now
+
+            try:
+                self._respond_to_player(player, message)
+            except Exception as exc:
+                logger.warning("Chat responder failed: %s", exc)
+
+    def _respond_to_player(self, player: str, message: str) -> None:
+        keyword = (self.settings.chat_mention_keyword or "prefect").lower()
+        msg = message
+        # If message starts with "prefect" style mention, strip it.
+        lower = msg.lower().strip()
+        for prefix in (keyword + ":", "@" + keyword, keyword):
+            if lower.startswith(prefix):
+                msg = msg[len(prefix) :].lstrip(" :,-")
+                break
+
+        system_prompt = (
+            "You are Prefect, a helpful steward AI for a Necesse dedicated server. "
+            "Reply briefly and politely. Do not give hacking/cheating advice. "
+            "If asked to do admin actions, explain you can only do safe server admin commands."
+        )
+        user_prompt = f"Player {player} said: {msg}\nReply as Prefect in 1-2 sentences.".strip()
+
+        # Call async Ollama from this thread.
+        reply = asyncio.run(self.ollama.generate(system_prompt, user_prompt))
+        safe = _coerce_safe_chat_text(reply, max_len=int(self.settings.chat_max_reply_length))
+
+        # Try to send to server chat.
+        out = self.announce(f"{player}: {safe}")
+        if not out.get("ok"):
+            # Last resort: strip harder and try again.
+            safe2 = _coerce_safe_chat_text(safe, max_len=int(self.settings.chat_max_reply_length)).replace("(", "").replace(")", "")
+            self.announce(f"{player}: {safe2}")
 
     def get_status(self) -> dict:
         st = self.controller.status()

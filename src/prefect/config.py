@@ -32,6 +32,12 @@ class PrefectSettings(BaseSettings):
     game_host: str = Field(default="127.0.0.1")
     game_port: int | None = Field(default=None)
 
+    # Chat mention responder (minimal trigger)
+    chat_mention_enabled: bool = Field(default=True)
+    chat_mention_keyword: str = Field(default="prefect")
+    chat_cooldown_seconds: float = Field(default=5.0)
+    chat_max_reply_length: int = Field(default=240)
+
     # Command capture window
     command_output_window_seconds: float = Field(default=2.0)
 

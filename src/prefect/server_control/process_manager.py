@@ -36,10 +36,14 @@ class NecesseProcessManager:
         log_buffer: RollingLogBuffer,
         command_output_window_seconds: float = 2.0,
         log_path: Path | None = None,
+        on_chat_mention=None,
+        chat_keyword: str = "prefect",
     ):
         self._server_root = server_root
         self._log_buffer = log_buffer
         self._log_path = log_path
+        self._on_chat_mention = on_chat_mention
+        self._chat_keyword = (chat_keyword or "prefect").lower()
         self._command_output_window_seconds = command_output_window_seconds
 
         self._proc: subprocess.Popen[str] | None = None
@@ -56,6 +60,11 @@ class NecesseProcessManager:
 
         self._re_join = re.compile(r"\b(?P<name>[^\s:]{2,32})\b.*\b(joined|connected)\b", re.IGNORECASE)
         self._re_leave = re.compile(r"\b(?P<name>[^\s:]{2,32})\b.*\b(left|disconnected)\b", re.IGNORECASE)
+
+        # Chat heuristics (Necesse log formats may vary)
+        self._re_chat1 = re.compile(r"^\[[^\]]+\]\s*(?P<name>[^:]{1,32}):\s*(?P<msg>.+)$")
+        self._re_chat2 = re.compile(r"^<(?P<name>[^>]{1,32})>\s*(?P<msg>.+)$")
+        self._re_chat3 = re.compile(r"^(?P<name>[^:]{1,32}):\s*(?P<msg>.+)$")
 
     def _detect_command(self) -> list[str]:
         if not self._server_root.exists():
@@ -200,6 +209,18 @@ class NecesseProcessManager:
             with self._state_lock:
                 self._last_error = line.strip()[:500]
 
+        # Detect chat mentions of Prefect.
+        if self._on_chat_mention is not None and self._chat_keyword in lower:
+            parsed = self._parse_chat(line.rstrip("\n"))
+            if parsed is not None:
+                name, msg = parsed
+                # Ignore messages that look like Prefect's own output.
+                if name.strip().lower() not in {"prefect", "server"}:
+                    try:
+                        self._on_chat_mention(name.strip()[:32], msg.strip()[:400])
+                    except Exception:
+                        pass
+
         m_join = self._re_join.search(line)
         if m_join:
             name = m_join.group("name")
@@ -212,3 +233,12 @@ class NecesseProcessManager:
             name = m_leave.group("name")
             with self._state_lock:
                 self._players_online.discard(name)
+
+    def _parse_chat(self, line: str) -> tuple[str, str] | None:
+        for rx in (self._re_chat1, self._re_chat2, self._re_chat3):
+            m = rx.match(line)
+            if m:
+                name = m.group("name")
+                msg = m.group("msg")
+                return name, msg
+        return None

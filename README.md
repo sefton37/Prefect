@@ -41,6 +41,15 @@ Environment variables (defaults shown):
 - `PREFECT_MCP_HOST=127.0.0.1`
 - `PREFECT_MCP_PORT=8765`
 
+## Chat mention responder
+If enabled, Prefect watches server logs for player chat lines that mention "Prefect" (case-insensitive) and replies using Ollama.
+
+Env vars:
+- `PREFECT_CHAT_MENTION_ENABLED=true`
+- `PREFECT_CHAT_MENTION_KEYWORD=prefect`
+- `PREFECT_CHAT_COOLDOWN_SECONDS=5`
+- `PREFECT_CHAT_MAX_REPLY_LENGTH=240`
+
 ## Run
 ```bash
 ./scripts/run_prefect.sh
