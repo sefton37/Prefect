@@ -27,6 +27,10 @@ class PrefectSettings(BaseSettings):
     # Log buffer
     log_buffer_lines: int = Field(default=2000)
 
+    # Optional connectivity probe (set port to enable)
+    game_host: str = Field(default="127.0.0.1")
+    game_port: int | None = Field(default=None)
+
     # Command capture window
     command_output_window_seconds: float = Field(default=2.0)
 
@@ -39,6 +43,7 @@ class PrefectSettings(BaseSettings):
     # Safety limits
     max_command_length: int = Field(default=200)
     max_announce_length: int = Field(default=300)
+    max_startup_reply_length: int = Field(default=8)
 
 
 def get_settings() -> PrefectSettings:

@@ -44,3 +44,31 @@ def sanitize_announce(message: str, *, max_length: int = 300) -> str:
 
     _check_common(msg)
     return msg
+
+
+def sanitize_startup_reply(reply: str, *, max_length: int = 8) -> str:
+    """Very strict sanitizer for interactive startup prompts.
+
+    Only allows short numeric answers (e.g. "1") or y/n (case-insensitive).
+    """
+
+    if reply is None:
+        raise UnsafeInputError("Reply is required")
+
+    value = reply.strip()
+    if not value:
+        raise UnsafeInputError("Reply is empty")
+
+    if len(value) > max_length:
+        raise UnsafeInputError(f"Reply exceeds max length ({max_length})")
+
+    _check_common(value)
+
+    lower = value.lower()
+    if lower in {"y", "n", "yes", "no"}:
+        return lower[0]
+
+    if value.isdigit():
+        return value
+
+    raise UnsafeInputError("Reply must be a number or y/n")

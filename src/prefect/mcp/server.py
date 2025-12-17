@@ -34,6 +34,14 @@ def _build_server():
     def announce(message: str) -> dict:
         return core.announce(message)
 
+    @mcp.tool(name="prefect.startup_reply")
+    def startup_reply(reply: str) -> dict:
+        return core.startup_reply(reply)
+
+    @mcp.tool(name="prefect.wait_until_ready")
+    def wait_until_ready(timeout_seconds: float = 60.0) -> dict:
+        return core.wait_until_ready(timeout_seconds=timeout_seconds)
+
     @mcp.tool(name="prefect.summarize_recent_logs")
     async def summarize_recent_logs(n: int = 50) -> dict:
         return await core.summarize_recent_logs(n=n)
