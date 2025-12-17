@@ -15,6 +15,12 @@ export PREFECT_SERVER_ROOT="${PREFECT_SERVER_ROOT:-/home/kellogg/necesse-server}
 export PREFECT_OLLAMA_URL="${PREFECT_OLLAMA_URL:-http://127.0.0.1:11434}"
 export PREFECT_MODEL="${PREFECT_MODEL:-llama3.1}"
 
+# Server control mode:
+# - managed: Prefect starts/owns the Necesse process
+# - tmux: Prefect attaches and sends commands to an existing tmux target
+export PREFECT_CONTROL_MODE="${PREFECT_CONTROL_MODE:-managed}"
+export PREFECT_TMUX_TARGET="${PREFECT_TMUX_TARGET:-necesse}"
+
 # Optional: file log tail mode
 # export PREFECT_LOG_PATH="/home/kellogg/necesse-server/logs/latest.log"
 

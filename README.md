@@ -35,6 +35,8 @@ Environment variables (defaults shown):
 - `PREFECT_OLLAMA_URL=http://127.0.0.1:11434`
 - `PREFECT_MODEL=llama3.1`
 - `PREFECT_LOG_PATH=` (optional; if set, Prefect tails this file)
+- `PREFECT_CONTROL_MODE=managed` (or `tmux`)
+- `PREFECT_TMUX_TARGET=necesse` (tmux target like `session:window.pane`)
 - `PREFECT_MCP_TRANSPORT=stdio` (or `sse` if supported by your MCP host)
 - `PREFECT_MCP_HOST=127.0.0.1`
 - `PREFECT_MCP_PORT=8765`

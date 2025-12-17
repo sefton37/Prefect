@@ -10,6 +10,7 @@ from prefect.ollama_client import OllamaClient, OllamaConfig
 from prefect.safety.allowlist import CommandAllowlist, CommandNotPermittedError
 from prefect.safety.sanitizer import UnsafeInputError, sanitize_announce, sanitize_command
 from prefect.server_control.command_runner import CommandRunner
+from prefect.server_control.controller import ManagedController, TmuxAttachController
 from prefect.server_control.process_manager import NecesseProcessManager
 from prefect.watchers.log_tail import RollingLogBuffer
 
@@ -28,7 +29,18 @@ class PrefectCore:
             command_output_window_seconds=self.settings.command_output_window_seconds,
             log_path=self.settings.log_path,
         )
-        self.command_runner = CommandRunner(self.process_manager)
+
+        mode = (self.settings.control_mode or "managed").lower()
+        if mode == "tmux":
+            self.controller = TmuxAttachController(
+                tmux_target=self.settings.tmux_target,
+                log_buffer=self.log_buffer,
+                output_window_seconds=self.settings.command_output_window_seconds,
+            )
+        else:
+            self.controller = ManagedController(self.process_manager)
+
+        self.command_runner = CommandRunner(self.controller)
 
         self.allowlist = CommandAllowlist.default()
         self.ollama = OllamaClient(OllamaConfig(base_url=self.settings.ollama_url, model=self.settings.model))
@@ -41,6 +53,9 @@ class PrefectCore:
             return
         self._started = True
 
+        if (self.settings.control_mode or "managed").lower() == "tmux":
+            return
+
         if self.settings.start_server:
             try:
                 self.process_manager.start()
@@ -49,7 +64,7 @@ class PrefectCore:
                 logger.error("Failed to start Necesse server process: %s", exc)
 
     def get_status(self) -> dict:
-        st = self.process_manager.status()
+        st = self.controller.status()
         return {
             **asdict(st),
             "prefect_uptime_seconds": max(0.0, time.time() - self._start_time),

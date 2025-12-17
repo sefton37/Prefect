@@ -30,6 +30,12 @@ class PrefectSettings(BaseSettings):
     # Command capture window
     command_output_window_seconds: float = Field(default=2.0)
 
+    # Server control mode
+    # - "managed": Prefect starts/owns the Necesse server process (stdin/stdout)
+    # - "tmux": Prefect attaches to an existing tmux session and sends keys
+    control_mode: str = Field(default="managed")
+    tmux_target: str = Field(default="necesse")
+
     # Safety limits
     max_command_length: int = Field(default=200)
     max_announce_length: int = Field(default=300)
