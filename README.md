@@ -47,7 +47,8 @@ Environment variables (defaults shown):
 ```
 
 If you want Prefect to manage the Necesse server process, ensure your server directory contains either:
-- `Server.sh` (preferred), or
+- `StartServer.sh` (your current setup), or
+- `Server.sh`, or
 - `Server.jar` (fallback, runs via `java -jar`)
 
 ## MCP tools

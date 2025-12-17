@@ -57,6 +57,10 @@ class NecesseProcessManager:
         if not self._server_root.exists():
             raise ServerNotConfiguredError(f"Necesse server root does not exist: {self._server_root}")
 
+        start_server_sh = self._server_root / "StartServer.sh"
+        if start_server_sh.exists():
+            return ["bash", str(start_server_sh)]
+
         server_sh = self._server_root / "Server.sh"
         if server_sh.exists():
             return ["bash", str(server_sh)]
