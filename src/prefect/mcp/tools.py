@@ -26,7 +26,7 @@ from prefect.watchers.log_tail import RollingLogBuffer
 logger = logging.getLogger(__name__)
 
 
-_DISALLOWED_FOR_ANNOUNCE = set(";|&><$`\\")
+_DISALLOWED_FOR_ANNOUNCE = set(";|&><$`\\(){}[]")
 
 
 def _coerce_safe_chat_text(text: str, *, max_len: int) -> str:

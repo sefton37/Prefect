@@ -62,9 +62,14 @@ class NecesseProcessManager:
         self._re_leave = re.compile(r"\b(?P<name>[^\s:]{2,32})\b.*\b(left|disconnected)\b", re.IGNORECASE)
 
         # Chat heuristics (Necesse log formats may vary)
-        self._re_chat1 = re.compile(r"^\[[^\]]+\]\s*(?P<name>[^:]{1,32}):\s*(?P<msg>.+)$")
-        self._re_chat2 = re.compile(r"^<(?P<name>[^>]{1,32})>\s*(?P<msg>.+)$")
-        self._re_chat3 = re.compile(r"^(?P<name>[^:]{1,32}):\s*(?P<msg>.+)$")
+        # Examples we try to handle:
+        #   [12:34:56] Name: message
+        #   <Name> message
+        #   Chat: Name: message
+        #   Name: message
+        self._re_chat1 = re.compile(r"\[[^\]]+\]\s*(?P<name>[^:]{1,32}):\s*(?P<msg>.+)$")
+        self._re_chat2 = re.compile(r"<(?P<name>[^>]{1,32})>\s*(?P<msg>.+)$")
+        self._re_chat3 = re.compile(r"(?:^|\bchat\b\s*[:\-]\s*)(?P<name>[^:]{1,32}):\s*(?P<msg>.+)$", re.IGNORECASE)
 
     def _detect_command(self) -> list[str]:
         if not self._server_root.exists():
@@ -220,6 +225,12 @@ class NecesseProcessManager:
                         self._on_chat_mention(name.strip()[:32], msg.strip()[:400])
                     except Exception:
                         pass
+            else:
+                # Breadcrumb for debugging: keyword present but we couldn't parse.
+                try:
+                    self._log_buffer.append(f"[Prefect] chat_parse_failed: {line.strip()[:240]}")
+                except Exception:
+                    pass
 
         m_join = self._re_join.search(line)
         if m_join:
@@ -235,8 +246,9 @@ class NecesseProcessManager:
                 self._players_online.discard(name)
 
     def _parse_chat(self, line: str) -> tuple[str, str] | None:
+        # Use search to allow prefixes (timestamps, log levels, etc.).
         for rx in (self._re_chat1, self._re_chat2, self._re_chat3):
-            m = rx.match(line)
+            m = rx.search(line)
             if m:
                 name = m.group("name")
                 msg = m.group("msg")
