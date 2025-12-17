@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+*.out
+*.pid
+*.sqlite
+.DS_Store
+
+# Local secrets / overrides
+.env
+.env.*
+config.local.*
+
+# Editor
+.vscode/
