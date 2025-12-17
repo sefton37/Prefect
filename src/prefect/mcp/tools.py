@@ -120,6 +120,7 @@ class PrefectCore:
     def _on_chat_mention(self, player: str, message: str) -> None:
         # Called from stdout reader thread.
         try:
+            self.log_buffer.append(f"[Prefect] chat_event_queued player={player} msg={message[:200]}")
             self._chat_queue.put_nowait((player, message))
         except Exception:
             pass
@@ -161,10 +162,12 @@ class PrefectCore:
         user_prompt = f"Player {player} said: {msg}\nReply as Prefect in 1-2 sentences.".strip()
 
         # Call async Ollama from this thread.
+        self.log_buffer.append(f"[Prefect] generating_reply player={player}")
         reply = asyncio.run(self.ollama.generate(system_prompt, user_prompt))
         safe = _coerce_safe_chat_text(reply, max_len=int(self.settings.chat_max_reply_length))
 
         # Try to send to server chat.
+        self.log_buffer.append(f"[Prefect] sending_reply_to_chat player={player}")
         out = self.announce(f"{player}: {safe}")
         if not out.get("ok"):
             # Last resort: strip harder and try again.

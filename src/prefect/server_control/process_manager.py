@@ -216,9 +216,17 @@ class NecesseProcessManager:
 
         # Detect chat mentions of Prefect.
         if self._on_chat_mention is not None and self._chat_keyword in lower:
+            try:
+                self._log_buffer.append(f"[Prefect] keyword_seen: {line.strip()[:240]}")
+            except Exception:
+                pass
             parsed = self._parse_chat(line.rstrip("\n"))
             if parsed is not None:
                 name, msg = parsed
+                try:
+                    self._log_buffer.append(f"[Prefect] chat_parsed from={name.strip()[:32]} msg={msg.strip()[:200]}")
+                except Exception:
+                    pass
                 # Ignore messages that look like Prefect's own output.
                 if name.strip().lower() not in {"prefect", "server"}:
                     try:
