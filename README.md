@@ -50,6 +50,12 @@ Env vars:
 - `PREFECT_CHAT_COOLDOWN_SECONDS=5`
 - `PREFECT_CHAT_MAX_REPLY_LENGTH=240`
 
+To control how Prefect posts messages into in-game chat (varies by server command set):
+- `PREFECT_ANNOUNCE_COMMAND_TEMPLATES="say {message}"`
+
+If `say` doesn’t show up in-game on your server, set multiple templates (comma-separated) and Prefect will try them in order:
+- `PREFECT_ANNOUNCE_COMMAND_TEMPLATES="say {message},announce {message},broadcast {message}"`
+
 ## Run
 ```bash
 ./scripts/run_prefect.sh

@@ -5,6 +5,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import asdict
 
 from prefect.config import PrefectSettings, get_settings
@@ -36,6 +37,18 @@ def _coerce_safe_chat_text(text: str, *, max_len: int) -> str:
     if len(value) > max_len:
         value = value[: max_len - 1].rstrip() + "…"
     return value
+
+
+def _looks_like_unknown_command(output: str) -> bool:
+    text = (output or "").lower()
+    needles = (
+        "unknown command",
+        "not recognized",
+        "unrecognized",
+        "invalid command",
+        "no such command",
+    )
+    return any(n in text for n in needles)
 
 
 class PrefectCore:
@@ -74,6 +87,14 @@ class PrefectCore:
             extra_prefixes.append(name)
             extra_prefixes.append(name + " ")
 
+        # Also allow announce candidates based on templates.
+        templates = [t.strip() for t in (self.settings.announce_command_templates or "").split(",") if t.strip()]
+        for tmpl in templates:
+            cmd_token = tmpl.strip().split(" ", 1)[0]
+            if cmd_token:
+                extra_prefixes.append(cmd_token)
+                extra_prefixes.append(cmd_token + " ")
+
         self.allowlist = CommandAllowlist.default(extra_prefixes=tuple(extra_prefixes))
         self.ollama = OllamaClient(OllamaConfig(base_url=self.settings.ollama_url, model=self.settings.model))
 
@@ -84,6 +105,7 @@ class PrefectCore:
         self._chat_thread: threading.Thread | None = None
         self._chat_stop = threading.Event()
         self._last_player_reply_ts: dict[str, float] = {}
+        self._chat_history: dict[str, deque[tuple[float, str, str]]] = {}
 
     def start(self) -> None:
         if self._started:
@@ -154,25 +176,54 @@ class PrefectCore:
                 msg = msg[len(prefix) :].lstrip(" :,-")
                 break
 
+        # Maintain a short per-player conversation context.
+        now = time.time()
+        key = player.lower()
+        history = self._chat_history.get(key)
+        if history is None:
+            history = deque(maxlen=max(2, int(self.settings.chat_context_turns)))
+            self._chat_history[key] = history
+
+        ttl = float(self.settings.chat_context_ttl_seconds)
+        while history and (now - history[0][0]) > ttl:
+            history.popleft()
+
+        history.append((now, "player", msg))
+
+        context_lines: list[str] = []
+        for _, role, text in list(history)[-int(self.settings.chat_context_turns) :]:
+            who = "Player" if role == "player" else "Prefect"
+            context_lines.append(f"{who}: {text}")
+        context_block = "\n".join(context_lines)
+
         system_prompt = (
             "You are Prefect, a helpful steward AI for a Necesse dedicated server. "
             "Reply briefly and politely. Do not give hacking/cheating advice. "
             "If asked to do admin actions, explain you can only do safe server admin commands."
         )
-        user_prompt = f"Player {player} said: {msg}\nReply as Prefect in 1-2 sentences.".strip()
+        user_prompt = (
+            f"Conversation so far:\n{context_block}\n\n"
+            f"Reply as Prefect to Player {player} in 1-2 sentences."
+        ).strip()
 
         # Call async Ollama from this thread.
         self.log_buffer.append(f"[Prefect] generating_reply player={player}")
         reply = asyncio.run(self.ollama.generate(system_prompt, user_prompt))
         safe = _coerce_safe_chat_text(reply, max_len=int(self.settings.chat_max_reply_length))
 
+        history.append((time.time(), "prefect", safe))
+
         # Try to send to server chat.
         self.log_buffer.append(f"[Prefect] sending_reply_to_chat player={player}")
-        out = self.announce(f"{player}: {safe}")
+        out = self.announce(f"@{player} {safe}")
+        self.log_buffer.append(f"[Prefect] chat_send_result ok={out.get('ok')} sent={out.get('sent')} err={out.get('error')}")
         if not out.get("ok"):
             # Last resort: strip harder and try again.
             safe2 = _coerce_safe_chat_text(safe, max_len=int(self.settings.chat_max_reply_length)).replace("(", "").replace(")", "")
-            self.announce(f"{player}: {safe2}")
+            out2 = self.announce(f"@{player} {safe2}")
+            self.log_buffer.append(
+                f"[Prefect] chat_send_retry ok={out2.get('ok')} sent={out2.get('sent')} err={out2.get('error')}"
+            )
 
     def get_status(self) -> dict:
         st = self.controller.status()
@@ -212,14 +263,23 @@ class PrefectCore:
         except UnsafeInputError as exc:
             return {"ok": False, "sent": False, "error": str(exc)}
 
-        # Best-effort mapping to server "say".
-        if self.allowlist.is_allowed(f"say {msg}"):
-            resp = self.run_command(f"say {msg}")
-            return {"ok": resp.get("ok", False), "sent": resp.get("ok", False), "error": resp.get("error")}
+        templates = [t.strip() for t in (self.settings.announce_command_templates or "").split(",") if t.strip()]
+        if not templates:
+            templates = ["say {message}"]
 
-        # If say isn't allowlisted, acknowledge locally.
-        self.log_buffer.append(f"[Prefect] announce (not sent to server): {msg}")
-        return {"ok": True, "sent": False}
+        last_err: str | None = None
+        last_out: str | None = None
+
+        for tmpl in templates:
+            cmd = tmpl.replace("{message}", msg)
+            resp = self.run_command(cmd)
+            last_out = resp.get("output", "")
+            if resp.get("ok") and not _looks_like_unknown_command(last_out):
+                return {"ok": True, "sent": True}
+            last_err = resp.get("error") or last_err
+
+        self.log_buffer.append(f"[Prefect] announce_failed (not sent): err={last_err} out={str(last_out)[:120]}")
+        return {"ok": False, "sent": False, "error": last_err or "Unable to post message to server chat"}
 
     def startup_reply(self, reply: str) -> dict:
         """Send a very-limited reply for interactive server startup prompts."""

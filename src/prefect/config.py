@@ -37,6 +37,13 @@ class PrefectSettings(BaseSettings):
     chat_mention_keyword: str = Field(default="prefect")
     chat_cooldown_seconds: float = Field(default=5.0)
     chat_max_reply_length: int = Field(default=240)
+    chat_context_turns: int = Field(default=6)
+    chat_context_ttl_seconds: float = Field(default=180.0)
+
+    # How Prefect posts messages into in-game chat.
+    # Comma-separated templates, tried in order. Use {message}.
+    # Example: "say {message},announce {message}"
+    announce_command_templates: str = Field(default="say {message}")
 
     # Command capture window
     command_output_window_seconds: float = Field(default=2.0)
