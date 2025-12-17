@@ -46,6 +46,8 @@ Environment variables (defaults shown):
 ./scripts/run_prefect.sh
 ```
 
+If you are switching to **managed mode**, stop any already-running Necesse dedicated server first (to avoid port conflicts), then start Prefect.
+
 If you want Prefect to manage the Necesse server process, ensure your server directory contains either:
 - `StartServer.sh` (your current setup), or
 - `Server.sh`, or

@@ -21,6 +21,9 @@ export PREFECT_MODEL="${PREFECT_MODEL:-llama3.1}"
 export PREFECT_CONTROL_MODE="${PREFECT_CONTROL_MODE:-managed}"
 export PREFECT_TMUX_TARGET="${PREFECT_TMUX_TARGET:-necesse}"
 
+# In managed mode, Prefect should own the server process by default.
+export PREFECT_START_SERVER="${PREFECT_START_SERVER:-true}"
+
 # Optional: file log tail mode
 # export PREFECT_LOG_PATH="/home/kellogg/necesse-server/logs/latest.log"
 
