@@ -49,7 +49,8 @@ Environment variables (defaults shown):
 If you are switching to **managed mode**, stop any already-running Necesse dedicated server first (to avoid port conflicts), then start Prefect.
 
 If you want Prefect to manage the Necesse server process, ensure your server directory contains either:
-- `StartServer.sh` (your current setup), or
+- `StartServer-nogui.sh` (preferred; headless), or
+- `StartServer.sh` (may launch a GUI on some setups), or
 - `Server.sh`, or
 - `Server.jar` (fallback, runs via `java -jar`)
 
