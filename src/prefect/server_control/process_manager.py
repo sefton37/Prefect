@@ -7,7 +7,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import logging
+
 from prefect.watchers.log_tail import FileTailer, RollingLogBuffer, StdoutReader
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -95,6 +99,8 @@ class NecesseProcessManager:
         )
         self._start_ts = time.time()
         self._last_restart_ts = self._start_ts
+
+        logger.info("Necesse server process started pid=%s cmd=%s", self._proc.pid, cmd)
 
         assert self._proc.stdout is not None
         self._stdout_reader = StdoutReader(self._proc.stdout, self._log_buffer, on_line=self._ingest_line)

@@ -47,10 +47,18 @@ def main() -> None:
     mcp, settings = _build_server()
 
     transport = (settings.mcp_transport or "stdio").lower()
+    logger.info(
+        "Prefect MCP starting transport=%s server_root=%s control_mode=%s",
+        transport,
+        settings.server_root,
+        settings.control_mode,
+    )
     if transport == "sse":
         # Best-effort: depending on MCP SDK version, args may differ.
+        logger.info("Prefect MCP SSE listening on http://%s:%s", settings.mcp_host, settings.mcp_port)
         mcp.run(transport="sse", host=settings.mcp_host, port=settings.mcp_port)
     else:
+        logger.info("Prefect MCP stdio ready (waiting for MCP client)")
         mcp.run()
 
 

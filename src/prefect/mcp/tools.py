@@ -53,6 +53,13 @@ class PrefectCore:
             return
         self._started = True
 
+        logger.info(
+            "PrefectCore starting control_mode=%s start_server=%s log_path=%s",
+            self.settings.control_mode,
+            self.settings.start_server,
+            self.settings.log_path,
+        )
+
         if (self.settings.control_mode or "managed").lower() == "tmux":
             return
 
