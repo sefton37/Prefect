@@ -55,6 +55,20 @@ Env vars:
 ./scripts/run_prefect.sh
 ```
 
+That starts the **headless MCP server** (stdio transport by default), so it will appear to “hang” waiting for an MCP client.
+
+## Run (GUI)
+Install GUI deps (one-time):
+```bash
+source .venv/bin/activate
+pip install -e '.[gui]'
+```
+
+Launch the GUI:
+```bash
+./run_prefect_gui.sh
+```
+
 If you are switching to **managed mode**, stop any already-running Necesse dedicated server first (to avoid port conflicts), then start Prefect.
 
 If you want Prefect to manage the Necesse server process, ensure your server directory contains either:
