@@ -70,6 +70,23 @@ class MainWindow(QtWidgets.QMainWindow):
         top.addWidget(self.stop_button)
         v.addLayout(top)
 
+        oll = QtWidgets.QGroupBox("Ollama")
+        oll_l = QtWidgets.QGridLayout(oll)
+        self.ollama_url = QtWidgets.QLineEdit(self.settings.ollama_url)
+        self.ollama_model = QtWidgets.QComboBox()
+        self.ollama_model.setEditable(True)
+        self.ollama_model.addItem(self.settings.model)
+        self.ollama_refresh = QtWidgets.QPushButton("Refresh")
+        self.ollama_apply = QtWidgets.QPushButton("Apply")
+
+        oll_l.addWidget(QtWidgets.QLabel("Server URL"), 0, 0)
+        oll_l.addWidget(self.ollama_url, 0, 1, 1, 3)
+        oll_l.addWidget(QtWidgets.QLabel("Model"), 1, 0)
+        oll_l.addWidget(self.ollama_model, 1, 1)
+        oll_l.addWidget(self.ollama_refresh, 1, 2)
+        oll_l.addWidget(self.ollama_apply, 1, 3)
+        v.addWidget(oll)
+
         mid = QtWidgets.QHBoxLayout()
 
         left = QtWidgets.QVBoxLayout()
@@ -90,6 +107,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.start_button.clicked.connect(self._on_start)
         self.stop_button.clicked.connect(self._on_stop)
+        self.ollama_refresh.clicked.connect(self._refresh_models)
+        self.ollama_apply.clicked.connect(self._apply_ollama)
         return w
 
     def _build_chat_page(self) -> QtWidgets.QWidget:
@@ -127,6 +146,41 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_button.setEnabled(False)
         if not resp.get("ok"):
             self._append_activity(f"stop failed: {resp}")
+
+    def _apply_ollama(self) -> None:
+        url = self.ollama_url.text().strip()
+        model = self.ollama_model.currentText().strip()
+        if not url:
+            self._append_activity("ollama url is empty")
+            return
+        if not model:
+            self._append_activity("ollama model is empty")
+            return
+        self.core.set_ollama(base_url=url, model=model)
+        self._append_activity(f"ollama set: {url} | model={model}")
+
+    def _refresh_models(self) -> None:
+        url = self.ollama_url.text().strip()
+        if not url:
+            self._append_activity("ollama url is empty")
+            return
+
+        # Use the typed URL for discovery.
+        self.core.set_ollama(base_url=url, model=self.ollama_model.currentText().strip() or self.settings.model)
+        resp = self.core.list_ollama_models()
+        if not resp.get("ok"):
+            self._append_activity(f"model refresh failed: {resp.get('error')}")
+            return
+
+        models = resp.get("models") or []
+        current = self.ollama_model.currentText().strip() or self.settings.model
+        self.ollama_model.clear()
+        if current:
+            self.ollama_model.addItem(current)
+        for m in models:
+            if m != current:
+                self.ollama_model.addItem(m)
+        self._append_activity(f"models loaded: {len(models)}")
 
     def _send_chat(self) -> None:
         text = self.chat_input.text().strip()

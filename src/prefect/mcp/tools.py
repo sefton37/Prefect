@@ -163,6 +163,48 @@ class PrefectCore:
         if self.settings.chat_mention_enabled:
             self._start_chat_thread()
 
+    def start_server(self) -> dict:
+        """Start the Necesse server process (managed mode only)."""
+
+        self.start()
+
+        mode = (self.settings.control_mode or "managed").lower()
+        if mode == "tmux":
+            return {"ok": False, "error": "control_mode=tmux; cannot start server process"}
+
+        try:
+            self.process_manager.start()
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def stop_server(self) -> dict:
+        """Stop the Necesse server process (managed mode only)."""
+
+        mode = (self.settings.control_mode or "managed").lower()
+        if mode == "tmux":
+            return {"ok": False, "error": "control_mode=tmux; cannot stop server process"}
+
+        try:
+            self.process_manager.stop()
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def set_ollama(self, *, base_url: str | None = None, model: str | None = None) -> None:
+        if base_url is not None and base_url.strip():
+            self.settings.ollama_url = base_url.strip()
+        if model is not None and model.strip():
+            self.settings.model = model.strip()
+        self.ollama = OllamaClient(OllamaConfig(base_url=self.settings.ollama_url, model=self.settings.model))
+
+    def list_ollama_models(self) -> dict:
+        try:
+            models = asyncio.run(self.ollama.list_models())
+            return {"ok": True, "models": models}
+        except Exception as exc:
+            return {"ok": False, "models": [], "error": str(exc)}
+
     def _start_chat_thread(self) -> None:
         if self._chat_thread and self._chat_thread.is_alive():
             return

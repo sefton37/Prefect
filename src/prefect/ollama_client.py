@@ -125,3 +125,53 @@ class OllamaClient:
         resp = await client.post("/v1/chat/completions", json=payload)
         resp.raise_for_status()
         return resp.json()
+
+    async def list_models(self, *, retries: int = 1) -> list[str]:
+        """Return a list of available model identifiers.
+
+        Tries Ollama native endpoint first (/api/tags), then OpenAI-compatible (/v1/models).
+        """
+
+        attempt = 0
+        last_error: Exception | None = None
+
+        while attempt <= retries:
+            attempt += 1
+            try:
+                async with httpx.AsyncClient(base_url=self._config.base_url, timeout=self._timeout) as client:
+                    try:
+                        resp = await client.get("/api/tags")
+                        resp.raise_for_status()
+                        data = resp.json()
+                        models = data.get("models") or []
+                        names: list[str] = []
+                        for m in models:
+                            if isinstance(m, dict):
+                                n = m.get("name")
+                                if isinstance(n, str) and n.strip():
+                                    names.append(n.strip())
+                        return sorted(set(names))
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response is None or exc.response.status_code != 404:
+                            raise
+
+                    # Fallback: OpenAI-compatible model list
+                    resp = await client.get("/v1/models")
+                    resp.raise_for_status()
+                    data = resp.json()
+                    items = data.get("data") or []
+                    names2: list[str] = []
+                    for it in items:
+                        if isinstance(it, dict):
+                            n = it.get("id") or it.get("name")
+                            if isinstance(n, str) and n.strip():
+                                names2.append(n.strip())
+                    return sorted(set(names2))
+
+            except (httpx.TimeoutException, httpx.HTTPError, ValueError) as exc:
+                last_error = exc
+                logger.warning("Ollama list_models failed: %s", exc)
+                if attempt <= retries:
+                    await asyncio.sleep(0.4 * attempt)
+
+        raise OllamaError(f"Ollama list_models failed after {retries + 1} attempts: {last_error}")
