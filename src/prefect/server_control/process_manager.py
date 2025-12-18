@@ -36,13 +36,17 @@ class NecesseProcessManager:
         log_buffer: RollingLogBuffer,
         command_output_window_seconds: float = 2.0,
         log_path: Path | None = None,
+        on_chat_line=None,
         on_chat_mention=None,
+        on_activity=None,
         chat_keyword: str = "prefect",
     ):
         self._server_root = server_root
         self._log_buffer = log_buffer
         self._log_path = log_path
+        self._on_chat_line = on_chat_line
         self._on_chat_mention = on_chat_mention
+        self._on_activity = on_activity
         self._chat_keyword = (chat_keyword or "prefect").lower()
         self._command_output_window_seconds = command_output_window_seconds
 
@@ -214,27 +218,25 @@ class NecesseProcessManager:
             with self._state_lock:
                 self._last_error = line.strip()[:500]
 
-        # Detect chat mentions of Prefect.
-        if self._on_chat_mention is not None and self._chat_keyword in lower:
-            try:
-                self._log_buffer.append(f"[Prefect] keyword_seen: {line.strip()[:240]}")
-            except Exception:
-                pass
-            parsed = self._parse_chat(line.rstrip("\n"))
-            if parsed is not None:
-                name, msg = parsed
+        parsed = self._parse_chat(line.rstrip("\n"))
+        if parsed is not None:
+            name, msg = parsed
+            if self._on_chat_line is not None:
                 try:
-                    self._log_buffer.append(f"[Prefect] chat_parsed from={name.strip()[:32]} msg={msg.strip()[:200]}")
+                    self._on_chat_line(name.strip()[:32], msg.strip()[:400])
                 except Exception:
                     pass
-                # Ignore messages that look like Prefect's own output.
+
+            # Detect chat mentions of Prefect (only on parsed chat).
+            if self._on_chat_mention is not None and self._chat_keyword in (msg or "").lower():
                 if name.strip().lower() not in {"prefect", "server"}:
                     try:
                         self._on_chat_mention(name.strip()[:32], msg.strip()[:400])
                     except Exception:
                         pass
-            else:
-                # Breadcrumb for debugging: keyword present but we couldn't parse.
+        else:
+            # Breadcrumb for debugging: keyword present but we couldn't parse.
+            if self._chat_keyword in lower:
                 try:
                     self._log_buffer.append(f"[Prefect] chat_parse_failed: {line.strip()[:240]}")
                 except Exception:
@@ -245,6 +247,11 @@ class NecesseProcessManager:
             name = m_join.group("name")
             with self._state_lock:
                 self._players_online.add(name)
+            if self._on_activity is not None:
+                try:
+                    self._on_activity("join", name.strip()[:32])
+                except Exception:
+                    pass
             return
 
         m_leave = self._re_leave.search(line)
@@ -252,6 +259,11 @@ class NecesseProcessManager:
             name = m_leave.group("name")
             with self._state_lock:
                 self._players_online.discard(name)
+            if self._on_activity is not None:
+                try:
+                    self._on_activity("leave", name.strip()[:32])
+                except Exception:
+                    pass
 
     def _parse_chat(self, line: str) -> tuple[str, str] | None:
         # Use search to allow prefixes (timestamps, log levels, etc.).

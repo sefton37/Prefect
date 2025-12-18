@@ -59,12 +59,18 @@ class PrefectCore:
 
         self.log_buffer = RollingLogBuffer(max_lines=self.settings.log_buffer_lines)
 
+        self._events_lock = threading.Lock()
+        self._chat_events: deque[tuple[float, str, str]] = deque(maxlen=500)
+        self._activity_events: deque[tuple[float, str]] = deque(maxlen=500)
+
         self.process_manager = NecesseProcessManager(
             server_root=self.settings.server_root,
             log_buffer=self.log_buffer,
             command_output_window_seconds=self.settings.command_output_window_seconds,
             log_path=self.settings.log_path,
+            on_chat_line=self._on_chat_line,
             on_chat_mention=self._on_chat_mention if self.settings.chat_mention_enabled else None,
+            on_activity=self._on_activity,
             chat_keyword=self.settings.chat_mention_keyword,
         )
 
@@ -106,6 +112,31 @@ class PrefectCore:
         self._chat_stop = threading.Event()
         self._last_player_reply_ts: dict[str, float] = {}
         self._chat_history: dict[str, deque[tuple[float, str, str]]] = {}
+
+    def _on_chat_line(self, player: str, message: str) -> None:
+        ts = time.time()
+        with self._events_lock:
+            self._chat_events.append((ts, player, message))
+
+    def _on_activity(self, kind: str, who: str) -> None:
+        ts = time.time()
+        text = f"{who} {('joined' if kind == 'join' else 'left')}"
+        with self._events_lock:
+            self._activity_events.append((ts, text))
+
+    def get_chat_events(self, *, since_ts: float | None = None) -> list[tuple[float, str, str]]:
+        with self._events_lock:
+            events = list(self._chat_events)
+        if since_ts is None:
+            return events
+        return [e for e in events if e[0] >= since_ts]
+
+    def get_activity_events(self, *, since_ts: float | None = None) -> list[tuple[float, str]]:
+        with self._events_lock:
+            events = list(self._activity_events)
+        if since_ts is None:
+            return events
+        return [e for e in events if e[0] >= since_ts]
 
     def start(self) -> None:
         if self._started:
@@ -275,6 +306,8 @@ class PrefectCore:
             resp = self.run_command(cmd)
             last_out = resp.get("output", "")
             if resp.get("ok") and not _looks_like_unknown_command(last_out):
+                # Emit a local chat event so UI can show server messages even if the server doesn't echo them.
+                self._on_chat_line("Server", msg)
                 return {"ok": True, "sent": True}
             last_err = resp.get("error") or last_err
 

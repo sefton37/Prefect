@@ -3,197 +3,176 @@ from __future__ import annotations
 import sys
 import time
 
+from PySide6 import QtCore, QtWidgets
+
 from prefect.config import get_settings
 from prefect.mcp.tools import PrefectCore
 
 
-def main() -> None:
-    # Import PySide6 only when launching GUI.
-    from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import (
-        QApplication,
-        QHBoxLayout,
-        QLabel,
-        QLineEdit,
-        QPushButton,
-        QTextEdit,
-        QVBoxLayout,
-        QWidget,
-    )
+def _fmt_time(ts: float) -> str:
+    return time.strftime("%H:%M", time.localtime(ts))
 
-    settings = get_settings()
-    core = PrefectCore(settings)
-    core.start()
 
-    app = QApplication(sys.argv)
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.settings = get_settings()
+        self.core = PrefectCore(self.settings)
 
-    root = QWidget()
-    root.setWindowTitle("Prefect (Necesse)")
+        self.setWindowTitle("Prefect")
+        self.resize(1100, 700)
 
-    status_label = QLabel("status: starting...")
-    config_label = QLabel("config: ...")
-    logs = QTextEdit()
-    logs.setReadOnly(True)
+        root = QtWidgets.QWidget()
+        self.setCentralWidget(root)
 
-    command_output = QTextEdit()
-    command_output.setReadOnly(True)
-    command_output.setPlaceholderText("Command output")
+        outer = QtWidgets.QHBoxLayout(root)
 
-    cmd = QLineEdit()
-    cmd.setPlaceholderText("Allowed command (e.g. help)")
-    send_cmd = QPushButton("Send")
+        # Left nav
+        self.nav = QtWidgets.QListWidget()
+        self.nav.setFixedWidth(170)
+        self.nav.addItem("Server")
+        self.nav.addItem("Chat")
+        self.nav.setCurrentRow(0)
+        outer.addWidget(self.nav)
 
-    send_help = QPushButton("Run help")
-    send_announce = QPushButton("Announce test")
+        # Pages
+        self.pages = QtWidgets.QStackedWidget()
+        outer.addWidget(self.pages, 1)
 
-    reply = QLineEdit()
-    reply.setPlaceholderText("Startup reply (number or y/n)")
-    send_reply = QPushButton("Reply")
+        self.server_page = self._build_server_page()
+        self.chat_page = self._build_chat_page()
+        self.pages.addWidget(self.server_page)
+        self.pages.addWidget(self.chat_page)
 
-    summarize = QPushButton("Summarize last 50")
+        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
 
-    llm_chat = QTextEdit()
-    llm_chat.setReadOnly(True)
-    llm_chat.setPlaceholderText("LLM chat transcript")
-    llm_input = QLineEdit()
-    llm_input.setPlaceholderText("Message Prefect (LLM test)")
-    llm_send = QPushButton("Ask")
+        # Poll timer
+        self._last_chat_ts = 0.0
+        self._last_activity_ts = 0.0
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(350)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
 
-    def refresh() -> None:
-        st = core.get_status()
-        status_label.setText(
-            f"running={st.get('running')} pid={st.get('pid')} port_open={st.get('game_port_open')}"
-        )
-        config_label.setText(
-            "config: "
-            f"ollama={settings.ollama_url} model={settings.model} "
-            f"announce_templates={settings.announce_command_templates}"
-        )
-        recent = core.get_recent_logs(200)
-        logs.setPlainText("\n".join(recent))
-        logs.verticalScrollBar().setValue(logs.verticalScrollBar().maximum())
+    def _build_server_page(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
 
-    def on_send_cmd() -> None:
-        text = cmd.text().strip()
-        if not text:
-            return
-        resp = core.run_command(text)
-        core.log_buffer.append(f"[Prefect] run_command ok={resp.get('ok')} err={resp.get('error')}")
-        if resp.get("output"):
-            command_output.setPlainText(resp.get("output", ""))
-        cmd.clear()
-        time.sleep(0.05)
-        refresh()
+        top = QtWidgets.QHBoxLayout()
+        self.status_label = QtWidgets.QLabel("Status: idle")
+        self.status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        top.addWidget(self.status_label, 1)
 
-    def on_run_help() -> None:
-        resp = core.run_command("help")
-        core.log_buffer.append(f"[Prefect] help ok={resp.get('ok')} err={resp.get('error')}")
-        command_output.setPlainText(resp.get("output", ""))
-        refresh()
+        self.start_button = QtWidgets.QPushButton("Start")
+        self.stop_button = QtWidgets.QPushButton("Stop")
+        self.stop_button.setEnabled(False)
+        top.addWidget(self.start_button)
+        top.addWidget(self.stop_button)
+        v.addLayout(top)
 
-    def on_announce_test() -> None:
-        resp = core.announce("Prefect: announce test")
-        core.log_buffer.append(
-            f"[Prefect] announce_test ok={resp.get('ok')} sent={resp.get('sent')} err={resp.get('error')}"
-        )
-        refresh()
+        mid = QtWidgets.QHBoxLayout()
 
-    def on_send_reply() -> None:
-        text = reply.text().strip()
-        if not text:
-            return
-        resp = core.startup_reply(text)
-        core.log_buffer.append(f"[Prefect] startup_reply ok={resp.get('ok')} err={resp.get('error')}")
-        reply.clear()
-        time.sleep(0.05)
-        refresh()
+        left = QtWidgets.QVBoxLayout()
+        left.addWidget(QtWidgets.QLabel("Players"))
+        self.players_list = QtWidgets.QListWidget()
+        left.addWidget(self.players_list, 1)
+        mid.addLayout(left, 1)
 
-    def on_summarize() -> None:
-        # Run async ollama call in the simplest way: block briefly.
-        import asyncio
+        right = QtWidgets.QVBoxLayout()
+        right.addWidget(QtWidgets.QLabel("Activity"))
+        self.activity_feed = QtWidgets.QPlainTextEdit()
+        self.activity_feed.setReadOnly(True)
+        self.activity_feed.setMaximumBlockCount(1000)
+        right.addWidget(self.activity_feed, 1)
+        mid.addLayout(right, 2)
 
-        resp = asyncio.run(core.summarize_recent_logs(50))
+        v.addLayout(mid, 1)
+
+        self.start_button.clicked.connect(self._on_start)
+        self.stop_button.clicked.connect(self._on_stop)
+        return w
+
+    def _build_chat_page(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+
+        self.chat_transcript = QtWidgets.QPlainTextEdit()
+        self.chat_transcript.setReadOnly(True)
+        self.chat_transcript.setMaximumBlockCount(3000)
+        v.addWidget(self.chat_transcript, 1)
+
+        row = QtWidgets.QHBoxLayout()
+        self.chat_input = QtWidgets.QLineEdit()
+        self.chat_input.setPlaceholderText("Send a message (try starting with 'Prefect ...')")
+        self.chat_send = QtWidgets.QPushButton("Send")
+        row.addWidget(self.chat_input, 1)
+        row.addWidget(self.chat_send)
+        v.addLayout(row)
+
+        self.chat_send.clicked.connect(self._send_chat)
+        self.chat_input.returnPressed.connect(self._send_chat)
+        return w
+
+    def _on_start(self) -> None:
+        resp = self.core.start_server()
         if resp.get("ok"):
-            core.log_buffer.append("[Prefect] summary: " + resp.get("summary", ""))
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
         else:
-            core.log_buffer.append("[Prefect] summarize_failed: " + resp.get("error", ""))
-        refresh()
+            self._append_activity(f"start failed: {resp}")
 
-    def on_llm_send() -> None:
-        text = llm_input.text().strip()
+    def _on_stop(self) -> None:
+        resp = self.core.stop_server()
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        if not resp.get("ok"):
+            self._append_activity(f"stop failed: {resp}")
+
+    def _send_chat(self) -> None:
+        text = self.chat_input.text().strip()
         if not text:
             return
-        llm_input.clear()
+        self.chat_input.clear()
 
-        llm_chat.append(f"Player: {text}")
+        # Broadcast to players via configured announce templates.
+        resp = self.core.announce(text)
+        if not resp.get("ok"):
+            self._append_activity(f"send failed: {resp}")
 
-        import asyncio
+    def _append_activity(self, line: str) -> None:
+        ts = time.time()
+        self.activity_feed.appendPlainText(f"[{_fmt_time(ts)}] {line}")
 
-        system_prompt = (
-            "You are Prefect, a helpful steward AI for a Necesse dedicated server. "
-            "Reply briefly and politely."
+    def _tick(self) -> None:
+        st = self.core.get_status()
+        players = st.get("players_online", []) or []
+        self.status_label.setText(
+            f"Status: {st.get('state')} | players={len(players)}"
+            + (f" | last_error={st.get('last_error')}" if st.get("last_error") else "")
         )
-        # Provide a small local transcript for context.
-        transcript = llm_chat.toPlainText().splitlines()[-20:]
-        user_prompt = "Conversation:\n" + "\n".join(transcript) + "\n\nReply as Prefect."
-        try:
-            reply_text = asyncio.run(core.ollama.generate(system_prompt, user_prompt))
-            llm_chat.append(f"Prefect: {reply_text.strip()}")
-        except Exception as exc:
-            llm_chat.append(f"Prefect (error): {exc}")
 
-    send_cmd.clicked.connect(on_send_cmd)
-    cmd.returnPressed.connect(on_send_cmd)
+        # Update players list
+        self.players_list.clear()
+        for p in sorted(players):
+            self.players_list.addItem(p)
 
-    send_help.clicked.connect(on_run_help)
-    send_announce.clicked.connect(on_announce_test)
+        # Less-verbose activity feed (join/leave + manual notes)
+        activity = self.core.get_activity_events(since_ts=self._last_activity_ts)
+        if activity:
+            self._last_activity_ts = max(ts for ts, _ in activity)
+            for ts, msg in activity:
+                self.activity_feed.appendPlainText(f"[{_fmt_time(ts)}] {msg}")
 
-    send_reply.clicked.connect(on_send_reply)
-    reply.returnPressed.connect(on_send_reply)
+        # Chatroom transcript (player messages + server messages + Prefect replies when they appear)
+        chat = self.core.get_chat_events(since_ts=self._last_chat_ts)
+        if chat:
+            self._last_chat_ts = max(ts for ts, _, _ in chat)
+            for ts, who, msg in chat:
+                self.chat_transcript.appendPlainText(f"[{_fmt_time(ts)}] {who}: {msg}")
 
-    summarize.clicked.connect(on_summarize)
 
-    llm_send.clicked.connect(on_llm_send)
-    llm_input.returnPressed.connect(on_llm_send)
-
-    layout = QVBoxLayout()
-    layout.addWidget(status_label)
-    layout.addWidget(config_label)
-    layout.addWidget(logs)
-    layout.addWidget(command_output)
-
-    row1 = QHBoxLayout()
-    row1.addWidget(cmd)
-    row1.addWidget(send_cmd)
-    row1.addWidget(send_help)
-    row1.addWidget(send_announce)
-    layout.addLayout(row1)
-
-    row2 = QHBoxLayout()
-    row2.addWidget(reply)
-    row2.addWidget(send_reply)
-    layout.addLayout(row2)
-
-    layout.addWidget(summarize)
-
-    layout.addWidget(llm_chat)
-    row3 = QHBoxLayout()
-    row3.addWidget(llm_input)
-    row3.addWidget(llm_send)
-    layout.addLayout(row3)
-
-    root.setLayout(layout)
-
-    timer = QTimer()
-    timer.timeout.connect(refresh)
-    timer.start(500)
-
-    refresh()
-    root.resize(900, 700)
-    root.show()
-
+def main() -> None:
+    app = QtWidgets.QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
