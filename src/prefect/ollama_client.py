@@ -63,11 +63,26 @@ class OllamaClient:
                 )
 
                 async with httpx.AsyncClient(base_url=self._config.base_url, timeout=self._timeout) as client:
-                    resp = await client.post("/api/generate", json=payload)
-                    resp.raise_for_status()
-                    data = resp.json()
+                    try:
+                        resp = await client.post("/api/generate", json=payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                    except httpx.HTTPStatusError as exc:
+                        # Some Ollama setups expose only the OpenAI-compatible API under /v1.
+                        if exc.response is not None and exc.response.status_code == 404:
+                            data = await self._generate_openai_compat(client, system_prompt, user_prompt)
+                        else:
+                            raise
 
+                # data can be either native {response: str} or openai-compat {choices:[{message:{content}}]}
                 text = data.get("response")
+                if not isinstance(text, str):
+                    try:
+                        choices = data.get("choices")
+                        text = choices[0]["message"]["content"] if choices else None
+                    except Exception:
+                        text = None
+
                 if not isinstance(text, str):
                     raise OllamaError(f"Unexpected Ollama response shape: {json.dumps(data)[:500]}")
 
@@ -86,3 +101,27 @@ class OllamaClient:
                     await asyncio.sleep(0.6 * attempt)
 
         raise OllamaError(f"Ollama generate failed after {retries + 1} attempts: {last_error}")
+
+    async def _generate_openai_compat(
+        self,
+        client: httpx.AsyncClient,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        """Fallback to Ollama's OpenAI-compatible API (if enabled).
+
+        Endpoint: /v1/chat/completions
+        """
+
+        payload: dict[str, Any] = {
+            "model": self._config.model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+
+        resp = await client.post("/v1/chat/completions", json=payload)
+        resp.raise_for_status()
+        return resp.json()
