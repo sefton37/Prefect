@@ -33,6 +33,10 @@ class OllamaClient:
         *,
         context: dict[str, Any] | None = None,
         retries: int = 2,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
     ) -> str:
         """Generate a completion using Ollama's HTTP API.
 
@@ -47,6 +51,19 @@ class OllamaClient:
         }
         if context is not None:
             payload["context"] = context
+        
+        # Add generation parameters if provided
+        options: dict[str, Any] = {}
+        if temperature is not None:
+            options["temperature"] = temperature
+        if top_p is not None:
+            options["top_p"] = top_p
+        if top_k is not None:
+            options["top_k"] = top_k
+        if repeat_penalty is not None:
+            options["repeat_penalty"] = repeat_penalty
+        if options:
+            payload["options"] = options
 
         attempt = 0
         last_error: Exception | None = None

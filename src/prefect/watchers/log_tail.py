@@ -6,7 +6,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Iterable, Pattern
+from typing import Callable, Deque, Iterable, Pattern
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,10 @@ class RollingLogBuffer:
     def get_since(self, ts: float) -> list[str]:
         with self._lock:
             return [e.line for e in self._lines if e.ts >= ts]
+
+    def get_since_with_ts(self, ts: float) -> list[tuple[float, str]]:
+        with self._lock:
+            return [(e.ts, e.line) for e in self._lines if e.ts >= ts]
 
     def search(self, pattern: str, *, n: int = 50, flags: int = re.IGNORECASE) -> list[str]:
         if n <= 0:
@@ -95,10 +99,18 @@ class StdoutReader:
 class FileTailer:
     """Tails a file and writes new lines into a RollingLogBuffer."""
 
-    def __init__(self, path: Path, buffer: RollingLogBuffer, *, poll_interval: float = 0.2):
+    def __init__(
+        self, 
+        path: Path, 
+        buffer: RollingLogBuffer, 
+        *, 
+        poll_interval: float = 0.2,
+        on_line: Callable[[str], None] | None = None,
+    ):
         self._path = path
         self._buffer = buffer
         self._poll_interval = poll_interval
+        self._on_line = on_line
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -131,6 +143,12 @@ class FileTailer:
                     line = fh.readline()
                     if line:
                         self._buffer.append(line)
+                        # Call the on_line callback if provided (for chat parsing, etc.)
+                        if self._on_line is not None:
+                            try:
+                                self._on_line(line)
+                            except Exception:
+                                pass  # Don't let callback errors stop tailing
                         continue
 
                 except FileNotFoundError:

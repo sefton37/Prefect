@@ -39,6 +39,10 @@ class PrefectSettings(BaseSettings):
     chat_max_reply_length: int = Field(default=240)
     chat_context_turns: int = Field(default=6)
     chat_context_ttl_seconds: float = Field(default=180.0)
+    
+    # Persistent conversation history settings
+    conversation_max_messages: int = Field(default=100)  # Max messages to store per player
+    conversation_max_age_days: int = Field(default=30)   # How long to keep conversation history
 
     # How Prefect posts messages into in-game chat.
     # Comma-separated templates, tried in order. Use {message}.
@@ -58,6 +62,25 @@ class PrefectSettings(BaseSettings):
     max_command_length: int = Field(default=200)
     max_announce_length: int = Field(default=300)
     max_startup_reply_length: int = Field(default=8)
+
+    # Debug mode - enables verbose logging of all server output
+    debug_verbose: bool = Field(default=True)
+
+    # Welcome messages for player joins
+    welcome_messages_enabled: bool = Field(default=True)
+    welcome_cooldown_seconds: float = Field(default=60.0)
+
+    # Command discovery settings
+    discovery_max_help_pages: int = Field(default=50)
+    discovery_page_stable_limit: int = Field(default=2)
+    discovery_help_cmd: str = Field(default="help")
+    discovery_help_page_template: str = Field(default="help {page}")
+    discovery_inter_page_delay: float = Field(default=0.5)
+
+    # Discovery output paths (relative to server_root)
+    discovery_output_dir: str = Field(default="prefect")
+    discovery_snapshots_subdir: str = Field(default="snapshots")
+    discovery_allowlist_subdir: str = Field(default="allowlist")
 
 
 def get_settings() -> PrefectSettings:

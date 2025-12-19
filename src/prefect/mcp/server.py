@@ -61,6 +61,24 @@ def _build_server():
     async def summarize_recent_logs(n: int = 50) -> dict:
         return await core.summarize_recent_logs(n=n)
 
+    @mcp.tool(name="prefect.bootstrap_allowlist")
+    def bootstrap_allowlist() -> dict:
+        """Discover server commands via paginated help and generate a default-deny allowlist.
+        
+        This runs command discovery, parses all available commands, classifies them
+        by safety, and generates allowlist files under the server's prefect/ directory.
+        
+        Returns dict with:
+        - ok: bool
+        - commands_discovered: number of commands found
+        - allowed_count: number of safe commands allowed
+        - denied_count: number of dangerous commands denied
+        - termination_reason: why discovery stopped
+        - snapshot_path: path to saved discovery snapshot
+        - allowlist_path: path to generated allowlist JSON
+        """
+        return core.bootstrap_allowlist()
+
     return mcp, settings
 
 

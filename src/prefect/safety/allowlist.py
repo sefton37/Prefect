@@ -27,6 +27,9 @@ class CommandAllowlist:
             "players",
             "list",
             "status",
+            # Interactive prompts
+            "y", "n", "yes", "no",
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
         )
         merged = tuple(dict.fromkeys(base + tuple(extra_prefixes)))
         return CommandAllowlist(prefixes=merged)
