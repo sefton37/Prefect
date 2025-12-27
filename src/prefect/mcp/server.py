@@ -37,6 +37,10 @@ def _build_server():
     def get_status() -> dict:
         return core.get_status()
 
+    @mcp.tool(name="prefect.get_bedrock_status")
+    def get_bedrock_status() -> dict:
+        return core.get_bedrock_status()
+
     @mcp.tool(name="prefect.get_recent_logs")
     def get_recent_logs(n: int) -> list[str]:
         return core.get_recent_logs(n)
@@ -44,6 +48,22 @@ def _build_server():
     @mcp.tool(name="prefect.run_command")
     def run_command(command: str) -> dict:
         return core.run_command(command)
+
+    @mcp.tool(name="prefect.run_bedrock_command")
+    def run_bedrock_command(command: str) -> dict:
+        return core.run_bedrock_command(command)
+
+    @mcp.tool(name="prefect.start_bedrock_server")
+    def start_bedrock_server() -> dict:
+        return core.start_bedrock_server()
+
+    @mcp.tool(name="prefect.stop_bedrock_server")
+    def stop_bedrock_server() -> dict:
+        return core.stop_bedrock_server()
+
+    @mcp.tool(name="prefect.update_bedrock_server")
+    def update_bedrock_server() -> dict:
+        return core.update_bedrock_server()
 
     @mcp.tool(name="prefect.announce")
     def announce(message: str) -> dict:

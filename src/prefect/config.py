@@ -13,6 +13,30 @@ class PrefectSettings(BaseSettings):
     log_path: Path | None = Field(default=None)
     commands_file: Path | None = Field(default=Path("commands.json"))
 
+    # Minecraft Bedrock Dedicated Server
+    bedrock_server_root: Path = Field(default=Path("/home/kellogg/bedrock_server"))
+    bedrock_log_path: Path | None = Field(default=None)
+    # If true, Prefect starts and owns the Bedrock server process.
+    # Default is false to avoid starting both servers unexpectedly.
+    bedrock_start_server: bool = Field(default=False)
+
+    # Bedrock server control mode
+    # - "managed": Prefect starts/owns the Bedrock server process (stdin/stdout)
+    # - "tmux": Prefect attaches to an existing tmux session and sends keys
+    bedrock_control_mode: str = Field(default="tmux")
+    bedrock_tmux_target: str = Field(default="bedrock")
+
+    # How Prefect posts messages into Bedrock in-game chat.
+    # Comma-separated templates, tried in order. Use {message}.
+    # Example: "say {message}"
+    bedrock_announce_command_templates: str = Field(default="say {message}")
+
+    # Bedrock auto-update settings
+    # If set, Prefect will download this zip directly instead of scraping the official download page.
+    bedrock_download_url: str | None = Field(default=None)
+    # Page Prefect scrapes to find the latest Linux Bedrock server zip (used when bedrock_download_url is unset).
+    bedrock_download_page_url: str = Field(default="https://www.minecraft.net/en-us/download/server/bedrock")
+
     ollama_url: str = Field(default="http://127.0.0.1:11434")
     model: str = Field(default="llama3.1")
 

@@ -9,6 +9,7 @@ import pytest
 
 from prefect.config import PrefectSettings
 from prefect.mcp.tools import PrefectCore, _coerce_safe_chat_text, _looks_like_unknown_command
+from prefect.server_control.controller import TmuxAttachController
 
 
 class TestCoerceSafeChatText:
@@ -83,6 +84,19 @@ class TestPrefectCoreInit:
         core = PrefectCore(settings)
         assert "help" in core.command_names
         assert "kick" in core.command_names
+
+    def test_bedrock_tmux_mode_uses_tmux_controller(self, temp_dir: Path):
+        settings = PrefectSettings(
+            server_root=temp_dir,
+            bedrock_server_root=temp_dir,
+            start_server=False,
+            bedrock_start_server=False,
+            bedrock_control_mode="tmux",
+            bedrock_tmux_target="bedrock",
+        )
+
+        core = PrefectCore(settings)
+        assert isinstance(core.bedrock_controller, TmuxAttachController)
 
 
 class TestPrefectCoreRunCommand:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import threading
@@ -425,3 +426,380 @@ class NecesseProcessManager:
         """Remove ANSI escape sequences from text."""
         import re
         return re.sub(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]", "", text)
+
+
+class BedrockProcessManager:
+    """Manage a Minecraft Bedrock Dedicated Server process.
+
+    This mirrors the minimal interface used by Prefect's controllers:
+    start(), stop(), status(), run_command_capture().
+
+    Bedrock logs are captured from stdout and optionally tailed from a file.
+    """
+
+    def __init__(
+        self,
+        *,
+        server_root: Path,
+        log_buffer: RollingLogBuffer,
+        command_output_window_seconds: float = 2.0,
+        log_path: Path | None = None,
+        on_chat_line=None,
+        on_chat_mention=None,
+        on_activity=None,
+        chat_keyword: str = "prefect",
+        debug_verbose: bool = False,
+    ):
+        self._server_root = server_root
+        self._log_buffer = log_buffer
+        self._log_path = log_path
+        self._on_chat_line = on_chat_line
+        self._on_chat_mention = on_chat_mention
+        self._on_activity = on_activity
+        self._chat_keyword = (chat_keyword or "prefect").lower()
+        self._debug_verbose = debug_verbose
+        self._command_output_window_seconds = command_output_window_seconds
+
+        self._proc: subprocess.Popen[str] | None = None
+        self._stdout_reader: StdoutReader | None = None
+        self._file_tailer: FileTailer | None = None
+
+        self._stdin_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+
+        self._start_ts: float | None = None
+        self._last_restart_ts: float | None = None
+        self._last_error: str | None = None
+        self._players_online: set[str] = set()
+
+        # Common Bedrock console output patterns (best-effort)
+        self._re_join = re.compile(r"\bPlayer\s+connected:\s*(?P<name>[^,]{2,32})\b", re.IGNORECASE)
+        self._re_leave = re.compile(r"\bPlayer\s+disconnected:\s*(?P<name>[^,]{2,32})\b", re.IGNORECASE)
+
+        # Chat patterns vary by BDS version. These are best-effort.
+        # Common variants we try to support:
+        #   <Steve> hello
+        #   Chat: Steve: hello
+        #   [INFO] Steve: hello
+        # NOTE: BDS console often prefixes lines (timestamp/level). Use search() and avoid ^ anchor.
+        self._re_chat_angle = re.compile(r"<(?P<name>[^>]{1,32})>\s*(?P<msg>.+)$")
+        self._re_chat_chatprefix = re.compile(r"\bchat\b\s*[:\-]\s*(?P<name>[^:]{1,32})\s*:\s*(?P<msg>.+)$", re.IGNORECASE)
+        self._re_chat_simple = re.compile(r"(?P<name>[A-Za-z0-9_\-]{2,32})\s*:\s*(?P<msg>.+)$")
+
+    def _detect_command(self) -> list[str]:
+        if not self._server_root.exists():
+            raise ServerNotConfiguredError(f"Bedrock server root does not exist: {self._server_root}")
+
+        exe = self._server_root / "bedrock_server"
+        if not exe.exists():
+            raise ServerNotConfiguredError(
+                "Could not find Bedrock server binary 'bedrock_server' in " f"{self._server_root}"
+            )
+        if not exe.is_file():
+            raise ServerNotConfiguredError(f"Bedrock server binary is not a file: {exe}")
+        if not exe.stat().st_mode & 0o111:
+            raise ServerNotConfiguredError(
+                f"Bedrock server binary is not executable: {exe} (try: chmod +x {exe})"
+            )
+        return [str(exe)]
+
+    def _read_server_properties(self) -> dict[str, str]:
+        """Best-effort parse of Bedrock server.properties.
+
+        We intentionally keep this lightweight and forgiving so it can be used
+        for preflight logging without impacting server startup.
+        """
+        props_path = self._server_root / "server.properties"
+        if not props_path.exists() or not props_path.is_file():
+            return {}
+
+        try:
+            text = props_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return {}
+
+        props: dict[str, str] = {}
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            props[k.strip()] = v.strip()
+        return props
+
+    def _log_startup_preflight(self) -> None:
+        props = self._read_server_properties()
+        level_name = props.get("level-name") or "(default)"
+        content_console = (props.get("content-log-console-output-enabled") or "").strip().lower()
+        content_file = (props.get("content-log-file-enabled") or "").strip().lower()
+        world_dir = self._server_root / "worlds" / (props.get("level-name") or "world")
+        world_exists = world_dir.exists()
+        has_level_dat = (world_dir / "level.dat").exists()
+        has_db_dir = (world_dir / "db").exists()
+
+        summary = (
+            f"[BDS:CFG] server_root={self._server_root} "
+            f"level-name={level_name} world_dir={world_dir} "
+            f"exists={world_exists} level.dat={has_level_dat} db_dir={has_db_dir} "
+            f"content-log-console-output-enabled={content_console or '(unset)'} "
+            f"content-log-file-enabled={content_file or '(unset)'}"
+        )
+
+        # Show in both logs and the in-app Bedrock console.
+        logger.info("%s", summary)
+        try:
+            self._log_buffer.append(summary)
+        except Exception:
+            pass
+
+        # If chat/content isn't logged to console, Prefect cannot detect chat mentions in tmux mode
+        # because it relies on console output piping.
+        if content_console not in {"true", "1", "yes"}:
+            warn = (
+                "[BDS:CFG] WARNING: Bedrock is not logging content/chat to console. "
+                "Set 'content-log-console-output-enabled=true' in server.properties "
+                "and restart Bedrock for 'Hi Prefect' chat mentions to work."
+            )
+            logger.warning("%s", warn)
+            try:
+                self._log_buffer.append(warn)
+            except Exception:
+                pass
+
+    def log_startup_preflight(self) -> None:
+        """Emit a config preflight summary into the Bedrock log buffer.
+
+        Useful in tmux mode where Prefect doesn't call start().
+        """
+        self._log_startup_preflight()
+
+    def start(self) -> None:
+        if self.is_running():
+            return
+
+        cmd = self._detect_command()
+
+        # Preflight: log which world the server is configured to load.
+        self._log_startup_preflight()
+
+        # Bedrock Dedicated Server on Linux expects its bundled shared libraries
+        # to be found via LD_LIBRARY_PATH. The official docs commonly suggest:
+        #   LD_LIBRARY_PATH=. ./bedrock_server
+        # Without this, it may load system OpenSSL/cURL libs and crash.
+        env = os.environ.copy()
+        root = str(self._server_root)
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = root if not existing else f"{root}:{existing}"
+
+        self._proc = subprocess.Popen(
+            cmd,
+            cwd=str(self._server_root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self._start_ts = time.time()
+        self._last_restart_ts = self._start_ts
+        logger.info("Bedrock server process started pid=%s cmd=%s", self._proc.pid, cmd)
+
+        assert self._proc.stdout is not None
+        self._stdout_reader = StdoutReader(self._proc.stdout, self._log_buffer, on_line=self._ingest_line)
+        self._stdout_reader.start()
+
+        if self._log_path is not None:
+            self._file_tailer = FileTailer(self._log_path, self._log_buffer, on_line=self._ingest_line)
+            self._file_tailer.start()
+
+    def start_log_tailing(self) -> None:
+        """Start tailing the log file without starting the server process.
+
+        This is used in tmux mode where the server is already running but we
+        still want to parse logs for chat mentions and player events.
+        """
+        if self._file_tailer is not None:
+            return  # Already tailing
+
+        if self._log_path is None:
+            logger.warning("Cannot start Bedrock log tailing: no log path configured")
+            return
+
+        self._file_tailer = FileTailer(self._log_path, self._log_buffer, on_line=self._ingest_line)
+        self._file_tailer.start()
+        logger.info("Started Bedrock log file tailing for %s", self._log_path)
+
+    def stop(self, *, grace_seconds: float = 8.0) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+
+        try:
+            # Bedrock supports the "stop" command.
+            try:
+                self.send_command_raw("stop")
+            except Exception:
+                pass
+
+            proc.terminate()
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        finally:
+            if self._stdout_reader is not None:
+                self._stdout_reader.stop()
+            if self._file_tailer is not None:
+                self._file_tailer.stop()
+            self._proc = None
+            self._stdout_reader = None
+            self._file_tailer = None
+            self._start_ts = None
+
+    def restart(self) -> None:
+        self.stop()
+        time.sleep(0.2)
+        self.start()
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def pid(self) -> int | None:
+        if self._proc is None:
+            return None
+        return self._proc.pid
+
+    def uptime_seconds(self) -> float | None:
+        if not self.is_running() or self._start_ts is None:
+            return None
+        return max(0.0, time.time() - self._start_ts)
+
+    def last_restart_time(self) -> float | None:
+        return self._last_restart_ts
+
+    def last_error(self) -> str | None:
+        with self._state_lock:
+            return self._last_error
+
+    def players_online(self) -> list[str]:
+        with self._state_lock:
+            return sorted(self._players_online)
+
+    def status(self) -> ServerStatus:
+        return ServerStatus(
+            running=self.is_running(),
+            pid=self.pid(),
+            uptime_seconds=self.uptime_seconds(),
+            last_error=self.last_error(),
+            last_restart_time=self.last_restart_time(),
+            players_online=self.players_online(),
+        )
+
+    def send_command_raw(self, command: str) -> None:
+        if not self.is_running() or self._proc is None or self._proc.stdin is None:
+            raise RuntimeError("Bedrock server is not running under Prefect")
+
+        with self._stdin_lock:
+            self._proc.stdin.write(command.rstrip("\n") + "\n")
+            self._proc.stdin.flush()
+
+    def run_command_capture(self, command: str) -> str:
+        start_ts = time.time()
+        self.send_command_raw(command)
+        time.sleep(self._command_output_window_seconds)
+        lines = self._log_buffer.get_since(start_ts)
+        return "\n".join(lines[-200:])
+
+    def _ingest_line(self, line: str) -> None:
+        lower = (line or "").lower()
+        line_stripped = (line or "").rstrip("\n")
+
+        if self._debug_verbose:
+            self._log_buffer.append(f"[BDS:RAW] {line_stripped[:500]}")
+
+        # Track last error if it looks like an error line.
+        if "error" in lower or "exception" in lower or "fatal" in lower:
+            with self._state_lock:
+                self._last_error = line_stripped[:500]
+
+        # === CHAT PARSING ===
+        parsed = self._parse_chat(line_stripped)
+        if parsed is None and self._debug_verbose and self._chat_keyword and self._chat_keyword in lower:
+            self._log_buffer.append(
+                f"[BDS:CHAT_PARSE_FAILED] keyword '{self._chat_keyword}' in line but no regex matched: {line_stripped[:240]}"
+            )
+        if parsed is not None:
+            name, msg = parsed
+            if self._on_chat_line is not None:
+                try:
+                    self._on_chat_line(name.strip()[:32], msg.strip()[:400])
+                except Exception:
+                    pass
+
+            if self._on_chat_mention is not None and self._chat_keyword in (msg or "").lower():
+                if name.strip().lower() not in {"prefect", "server"}:
+                    try:
+                        self._on_chat_mention(name.strip()[:32], msg.strip()[:400])
+                    except Exception:
+                        pass
+
+        m_join = self._re_join.search(line_stripped)
+        if m_join:
+            name = m_join.group("name").strip()[:32]
+            with self._state_lock:
+                self._players_online.add(name)
+            if self._on_activity is not None:
+                try:
+                    self._on_activity("join", name)
+                except Exception:
+                    pass
+            return
+
+        m_leave = self._re_leave.search(line_stripped)
+        if m_leave:
+            name = m_leave.group("name").strip()[:32]
+            with self._state_lock:
+                self._players_online.discard(name)
+            if self._on_activity is not None:
+                try:
+                    self._on_activity("leave", name)
+                except Exception:
+                    pass
+            return
+
+    def _parse_chat(self, line: str) -> tuple[str, str] | None:
+        clean = line.strip()
+        if not clean:
+            return None
+
+        # Skip obvious non-chat server lines.
+        server_indicators = (
+            "Player connected:",
+            "Player disconnected:",
+            "Server started",
+            "NO LOG FILE",
+            "Version",
+            "Level Name",
+            "IPv4 supported",
+            "IPv6 supported",
+            "ERROR",
+            "Exception",
+        )
+        for indicator in server_indicators:
+            if indicator.lower() in clean.lower():
+                return None
+
+        for rx in (self._re_chat_angle, self._re_chat_chatprefix, self._re_chat_simple):
+            m = rx.search(clean)
+            if not m:
+                continue
+            name = m.group("name").strip()
+            msg = m.group("msg").strip()
+
+            if len(name) < 2:
+                continue
+            return name, msg
+
+        return None

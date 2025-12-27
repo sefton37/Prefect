@@ -1,6 +1,6 @@
 # Prefect (Necesse Steward)
 
-Prefect is a server-side AI steward for a Necesse dedicated server.
+Prefect is a server-side AI steward that can manage or attach to game servers and expose control via MCP and a local Qt GUI.
 
 Phase 1 provides:
 - Managed server process control (run Necesse under Prefect)
@@ -14,11 +14,26 @@ Phase 1 provides:
   - `prefect.announce`
   - `prefect.summarize_recent_logs` (helper tool for Phase 1 DoD)
 
+Minecraft Bedrock Dedicated Server (BDS) support includes:
+- Start/stop + command sending via **tmux** (default)
+- Optional managed subprocess mode (stdin/stdout)
+- Safe in-place updater that preserves `worlds/` and common config files
+
 ## Requirements
-- Ubuntu host
-- Python 3.11+
-- Ollama already running locally
-- Necesse server files in `/home/kellogg/necesse-server`
+### Host / system dependencies
+- Linux host (tested on Ubuntu)
+- Python 3.11+ (3.12 is fine)
+- `tmux` (required for the default Minecraft Bedrock control mode)
+  - Ubuntu/Debian: `sudo apt-get update && sudo apt-get install -y tmux`
+- Java runtime (only required if your Necesse install uses `Server.jar`)
+
+### External services (optional)
+- Ollama running locally (only required for AI chat responses / summaries)
+  - Default: `PREFECT_OLLAMA_URL=http://127.0.0.1:11434`
+
+### Game server files
+- Necesse dedicated server files (default): `/home/kellogg/necesse-server`
+- Minecraft Bedrock Dedicated Server files (default): `/home/kellogg/bedrock_server`
 
 ## Setup
 ```bash
@@ -27,6 +42,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -e .
+```
+
+Install optional extras:
+```bash
+# GUI
+pip install -e '.[gui]'
+
+# Dev/test
+pip install -e '.[dev]'
 ```
 
 ## Configuration
@@ -40,6 +64,20 @@ Environment variables (defaults shown):
 - `PREFECT_MCP_TRANSPORT=stdio` (or `sse` if supported by your MCP host)
 - `PREFECT_MCP_HOST=127.0.0.1`
 - `PREFECT_MCP_PORT=8765`
+
+### Minecraft Bedrock settings
+- `PREFECT_BEDROCK_SERVER_ROOT=/home/kellogg/bedrock_server`
+- `PREFECT_BEDROCK_CONTROL_MODE=tmux` (default; or `managed`)
+- `PREFECT_BEDROCK_TMUX_TARGET=bedrock`
+- `PREFECT_BEDROCK_START_SERVER=false`
+  - If `true` and in `tmux` mode, Prefect creates the tmux session and starts BDS inside it.
+  - If `true` and in `managed` mode, Prefect starts BDS as a subprocess.
+- `PREFECT_BEDROCK_LOG_PATH=`
+  - Optional. In `tmux` mode, if unset, Prefect will pipe tmux output into:
+    - `<bedrock_server_root>/prefect_bedrock_tmux.log`
+
+To control how Prefect posts messages into Minecraft Bedrock in-game chat:
+- `PREFECT_BEDROCK_ANNOUNCE_COMMAND_TEMPLATES="say {message}"`
 
 ## Chat mention responder
 If enabled, Prefect watches server logs for player chat lines that mention "Prefect" (case-insensitive) and replies using Ollama.

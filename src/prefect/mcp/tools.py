@@ -9,6 +9,7 @@ import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 
 from prefect.config import PrefectSettings, get_settings
 from prefect.command_catalog import load_command_names
@@ -28,9 +29,10 @@ from prefect.safety.sanitizer import (
 )
 from prefect.server_control.command_runner import CommandRunner
 from prefect.server_control.controller import ManagedController, TmuxAttachController
-from prefect.server_control.process_manager import NecesseProcessManager
+from prefect.server_control.process_manager import BedrockProcessManager, NecesseProcessManager
 from prefect.server_control.probes import tcp_port_open
 from prefect.watchers.log_tail import RollingLogBuffer
+from prefect.bedrock_updater import update_bedrock_server_in_place
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +67,10 @@ class PrefectCore:
 
         self.command_names = load_command_names(self.settings.commands_file)
 
+        # Necesse logs (also used for chat parsing + activity events)
         self.log_buffer = RollingLogBuffer(max_lines=self.settings.log_buffer_lines)
+        # Bedrock logs (separate so console views don't intermix)
+        self.bedrock_log_buffer = RollingLogBuffer(max_lines=self.settings.log_buffer_lines)
 
         self._events_lock = threading.Lock()
         self._chat_events: deque[tuple[float, str, str]] = deque(maxlen=500)
@@ -83,6 +88,25 @@ class PrefectCore:
             debug_verbose=self.settings.debug_verbose,
         )
 
+        bedrock_mode = (self.settings.bedrock_control_mode or "managed").lower()
+        bedrock_log_path = self.settings.bedrock_log_path
+        # In tmux mode we don't capture stdout, so create a default log file path
+        # and pipe tmux output into it for log tailing + chat mention detection.
+        if bedrock_mode == "tmux" and bedrock_log_path is None:
+            bedrock_log_path = self.settings.bedrock_server_root / "prefect_bedrock_tmux.log"
+
+        self.bedrock_process_manager = BedrockProcessManager(
+            server_root=self.settings.bedrock_server_root,
+            log_buffer=self.bedrock_log_buffer,
+            command_output_window_seconds=self.settings.command_output_window_seconds,
+            log_path=bedrock_log_path,
+            on_chat_line=self._on_bedrock_chat_line,
+            on_chat_mention=self._on_bedrock_chat_mention if self.settings.chat_mention_enabled else None,
+            on_activity=self._on_bedrock_activity,
+            chat_keyword=self.settings.chat_mention_keyword,
+            debug_verbose=self.settings.debug_verbose,
+        )
+
         mode = (self.settings.control_mode or "managed").lower()
         if mode == "tmux":
             self.controller = TmuxAttachController(
@@ -93,7 +117,23 @@ class PrefectCore:
         else:
             self.controller = ManagedController(self.process_manager)
 
+        if bedrock_mode == "tmux":
+            # Start Bedrock inside tmux with the same library setup recommended by
+            # the official Linux instructions: LD_LIBRARY_PATH=. ./bedrock_server
+            bedrock_start_cmd = ["env", "LD_LIBRARY_PATH=.", "./bedrock_server"]
+            self.bedrock_controller = TmuxAttachController(
+                tmux_target=self.settings.bedrock_tmux_target,
+                log_buffer=self.bedrock_log_buffer,
+                output_window_seconds=self.settings.command_output_window_seconds,
+                start_command=bedrock_start_cmd,
+                start_cwd=str(self.settings.bedrock_server_root),
+                pipe_output_path=str(bedrock_log_path) if bedrock_log_path is not None else None,
+            )
+        else:
+            self.bedrock_controller = ManagedController(self.bedrock_process_manager)
+
         self.command_runner = CommandRunner(self.controller)
+        self.bedrock_command_runner = CommandRunner(self.bedrock_controller)
 
         # Convert command names into safe allowlist prefixes.
         # For single-word commands like "help" allow exact match; for arg commands, allow "cmd " prefix.
@@ -125,8 +165,24 @@ class PrefectCore:
             enabled=self.settings.welcome_messages_enabled,
         )
 
+        self.bedrock_player_tracker = PlayerTracker(
+            storage_path=Path.home() / ".config" / "prefect" / "bedrock_players.json"
+        )
+        self.bedrock_player_event_handler = PlayerEventHandler(
+            player_tracker=self.bedrock_player_tracker,
+            send_message=self._send_bedrock_welcome_message,
+            generate_message=self._generate_welcome_message,
+            enabled=self.settings.welcome_messages_enabled,
+        )
+
         # Persistent conversation history for chat interactions
         self.conversation_store = ConversationHistoryStore(
+            max_messages_per_player=self.settings.conversation_max_messages,
+            max_message_age_days=self.settings.conversation_max_age_days,
+        )
+
+        self.bedrock_conversation_store = ConversationHistoryStore(
+            storage_path=Path.home() / ".config" / "prefect" / "bedrock_conversations.json",
             max_messages_per_player=self.settings.conversation_max_messages,
             max_message_age_days=self.settings.conversation_max_age_days,
         )
@@ -134,7 +190,7 @@ class PrefectCore:
         self._started = False
         self._start_time = time.time()
 
-        self._chat_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        self._chat_queue: "queue.Queue[tuple[Literal['necesse', 'bedrock'], str, str]]" = queue.Queue()
         self._chat_thread: threading.Thread | None = None
         self._chat_stop = threading.Event()
         self._last_player_reply_ts: dict[str, float] = {}
@@ -162,6 +218,22 @@ class PrefectCore:
             ).start()
         elif kind == "leave":
             self.player_event_handler.on_player_leave(who)
+
+    def _on_bedrock_activity(self, kind: str, who: str) -> None:
+        ts = time.time()
+        text = f"[Bedrock] {who} {('joined' if kind == 'join' else 'left')}"
+        with self._events_lock:
+            self._activity_events.append((ts, text))
+
+        if kind == "join":
+            threading.Thread(
+                target=self._handle_bedrock_player_join,
+                args=(who,),
+                name=f"prefect-bedrock-welcome-{who}",
+                daemon=True,
+            ).start()
+        elif kind == "leave":
+            self.bedrock_player_event_handler.on_player_leave(who)
     
     def _handle_player_join(self, player_name: str) -> None:
         """Handle a player join event (runs in background thread)."""
@@ -171,6 +243,14 @@ class PrefectCore:
                 self.log_buffer.append(f"[Prefect] Welcomed {player_name}: {message[:100]}")
         except Exception as e:
             logger.error("Failed to handle player join for %s: %s", player_name, e)
+
+    def _handle_bedrock_player_join(self, player_name: str) -> None:
+        try:
+            message = self.bedrock_player_event_handler.on_player_join(player_name)
+            if message:
+                self.bedrock_log_buffer.append(f"[Prefect] Welcomed {player_name}: {message[:100]}")
+        except Exception as e:
+            logger.error("Failed to handle bedrock player join for %s: %s", player_name, e)
     
     def _send_welcome_message(self, message: str) -> None:
         """Send a welcome message to the server chat."""
@@ -181,6 +261,16 @@ class PrefectCore:
                 logger.warning("Failed to send welcome message: %s", result.get("error"))
         except Exception as e:
             logger.error("Failed to send welcome message: %s", e)
+
+    def _send_bedrock_welcome_message(self, message: str) -> None:
+        """Send a welcome message to Bedrock server chat."""
+        try:
+            safe = _coerce_safe_chat_text(message, max_len=int(self.settings.chat_max_reply_length))
+            result = self.bedrock_announce(safe)
+            if not result.get("ok"):
+                logger.warning("Failed to send bedrock welcome message: %s", result.get("error"))
+        except Exception as e:
+            logger.error("Failed to send bedrock welcome message: %s", e)
     
     def _generate_welcome_message(self, system_prompt: str, user_prompt: str) -> str:
         """Generate a welcome message using Ollama."""
@@ -249,6 +339,22 @@ class PrefectCore:
                 # Keep running so log-only mode can still work (e.g., if log_path is set).
                 logger.error("Failed to start Necesse server process: %s", exc)
 
+        bedrock_mode = (self.settings.bedrock_control_mode or "managed").lower()
+        if bedrock_mode == "tmux":
+            # In tmux mode, we don't start the server process but we still want
+            # to tail logs for chat mentions and player events.
+            self.bedrock_process_manager.start_log_tailing()
+            if self.settings.bedrock_start_server:
+                try:
+                    self.bedrock_controller.start()
+                except Exception as exc:
+                    logger.error("Failed to start Bedrock server via tmux: %s", exc)
+        elif self.settings.bedrock_start_server:
+            try:
+                self.bedrock_process_manager.start()
+            except Exception as exc:
+                logger.error("Failed to start Bedrock server process: %s", exc)
+
 
     def start_server(self) -> dict:
         """Start the Necesse server process (managed mode only)."""
@@ -275,6 +381,98 @@ class PrefectCore:
         try:
             self.process_manager.stop()
             return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # === Minecraft Bedrock Server Control ===
+
+    def start_bedrock_server(self) -> dict:
+        """Start the Minecraft Bedrock server process (managed only).
+
+        In bedrock_control_mode=tmux, Prefect attaches to an existing session and
+        does not start the process.
+        """
+        self.start()
+
+        bedrock_mode = (self.settings.bedrock_control_mode or "managed").lower()
+        if bedrock_mode == "tmux":
+            try:
+                self.bedrock_process_manager.log_startup_preflight()
+            except Exception:
+                pass
+            try:
+                self.bedrock_controller.start()
+                return {"ok": True}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+        try:
+            self.bedrock_process_manager.start()
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def stop_bedrock_server(self) -> dict:
+        """Stop the Minecraft Bedrock server.
+
+        - managed mode: stop the subprocess Prefect started
+        - tmux mode: send the in-server 'stop' command via tmux
+        """
+        bedrock_mode = (self.settings.bedrock_control_mode or "managed").lower()
+        if bedrock_mode == "tmux":
+            try:
+                result = self.bedrock_command_runner.run("stop")
+                if result.ok:
+                    return {"ok": True, "output": result.output}
+                return {"ok": False, "error": result.error or "stop failed", "output": result.output}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc), "output": ""}
+
+        try:
+            self.bedrock_process_manager.stop()
+            return {"ok": True}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def update_bedrock_server(self) -> dict:
+        """Update the Bedrock server binaries in bedrock_server_root.
+
+        This preserves worlds/ and common config files.
+        For safety, it refuses to run while the Bedrock server is running.
+        """
+
+        if self.bedrock_process_manager.is_running():
+            return {"ok": False, "error": "Bedrock server is running; stop it before updating"}
+
+        def _log(msg: str) -> None:
+            try:
+                self.bedrock_log_buffer.append(msg)
+            except Exception:
+                pass
+
+        try:
+            _log("[BDS:UPDATE] starting...")
+            result = update_bedrock_server_in_place(
+                server_root=self.settings.bedrock_server_root,
+                download_url=self.settings.bedrock_download_url,
+                download_page_url=self.settings.bedrock_download_page_url,
+                log=_log,
+            )
+            _log("[BDS:UPDATE] done")
+            return {
+                "ok": True,
+                "download_url": result.download_url,
+                "backup_dir": str(result.backup_dir),
+            }
+        except Exception as exc:
+            logger.exception("Bedrock update failed")
+            _log(f"[BDS:UPDATE] failed: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    def kill_bedrock_zombie_processes(self) -> dict:
+        """Force kill any lingering Bedrock server processes."""
+        try:
+            subprocess.run(["pkill", "-f", "bedrock_server"], check=False)
+            return {"ok": True, "message": "Sent kill signal to processes matching: bedrock_server"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -452,33 +650,53 @@ class PrefectCore:
         self._chat_thread.start()
 
     def _on_chat_mention(self, player: str, message: str) -> None:
+        # Necesse chat mention (kept for backwards wiring)
+        self._queue_chat_mention("necesse", player, message)
+
+    def _on_bedrock_chat_line(self, player: str, message: str) -> None:
+        ts = time.time()
+        with self._events_lock:
+            self._chat_events.append((ts, f"[Bedrock]{player}", message))
+
+    def _on_bedrock_chat_mention(self, player: str, message: str) -> None:
+        self._queue_chat_mention("bedrock", player, message)
+
+    def _queue_chat_mention(self, server_kind: Literal["necesse", "bedrock"], player: str, message: str) -> None:
         # Called from stdout reader thread.
         try:
-            self.log_buffer.append(f"[Prefect] chat_event_queued player={player} msg={message[:200]}")
-            self._chat_queue.put_nowait((player, message))
+            if server_kind == "bedrock":
+                self.bedrock_log_buffer.append(
+                    f"[Prefect] chat_event_queued server={server_kind} player={player} msg={message[:200]}"
+                )
+            else:
+                self.log_buffer.append(
+                    f"[Prefect] chat_event_queued server={server_kind} player={player} msg={message[:200]}"
+                )
+            self._chat_queue.put_nowait((server_kind, player, message))
         except Exception:
             pass
 
     def _chat_worker(self) -> None:
         while not self._chat_stop.is_set():
             try:
-                player, message = self._chat_queue.get(timeout=0.25)
+                server_kind, player, message = self._chat_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
 
             now = time.time()
-            last = self._last_player_reply_ts.get(player.lower(), 0.0)
+            last_key = f"{server_kind}:{player.lower()}"
+            last = self._last_player_reply_ts.get(last_key, 0.0)
             if now - last < float(self.settings.chat_cooldown_seconds):
                 continue
 
-            self._last_player_reply_ts[player.lower()] = now
+            self._last_player_reply_ts[last_key] = now
 
             try:
-                self._respond_to_player(player, message)
+                self._respond_to_player(server_kind, player, message)
             except Exception as exc:
                 logger.warning("Chat responder failed: %s", exc)
 
-    def _respond_to_player(self, player: str, message: str) -> None:
+    def _respond_to_player(self, server_kind: Literal["necesse", "bedrock"], player: str, message: str) -> None:
         keyword = (self.settings.chat_mention_keyword or "prefect").lower()
         msg = message
         # If message starts with "prefect" style mention, strip it.
@@ -488,11 +706,22 @@ class PrefectCore:
                 msg = msg[len(prefix) :].lstrip(" :,-")
                 break
 
+        if server_kind == "bedrock":
+            tracker = self.bedrock_player_tracker
+            store = self.bedrock_conversation_store
+            announce_fn = self.bedrock_announce
+            controller = self.bedrock_controller
+        else:
+            tracker = self.player_tracker
+            store = self.conversation_store
+            announce_fn = self.announce
+            controller = self.controller
+
         # Record player message in persistent conversation store
-        self.conversation_store.add_player_message(player, msg)
-        
+        store.add_player_message(player, msg)
+
         # Get player info for context
-        player_record = self.player_tracker.get_player(player)
+        player_record = tracker.get_player(player)
         player_context = ""
         if player_record:
             player_context = (
@@ -503,14 +732,14 @@ class PrefectCore:
         # Build conversation context from persistent history
         # Use session TTL for "recent" context, but also include older history
         session_ttl = float(self.settings.chat_context_ttl_seconds)
-        recent_context = self.conversation_store.get_context_for_player(
+        recent_context = store.get_context_for_player(
             player,
             recent_count=int(self.settings.chat_context_turns),
             session_ttl_seconds=session_ttl,
         )
         
         # Also get some older history for longer-term context (if available)
-        full_history = self.conversation_store.get_context_for_player(
+        full_history = store.get_context_for_player(
             player,
             recent_count=int(self.settings.chat_context_turns) * 2,
             session_ttl_seconds=None,  # No TTL filter
@@ -518,7 +747,7 @@ class PrefectCore:
         
         # If there's more history than recent session, mention it
         history_note = ""
-        conv_summary = self.conversation_store.get_player_summary(player)
+        conv_summary = store.get_player_summary(player)
         if conv_summary["total_messages"] > int(self.settings.chat_context_turns):
             history_note = f"(You have spoken with {player} {conv_summary['total_messages']} times before.)\n"
 
@@ -536,7 +765,14 @@ class PrefectCore:
 
         # Call async Ollama from this thread with persona parameters.
         params = persona.parameters
-        self.log_buffer.append(f"[Prefect] generating_reply player={player} persona={persona.name} history={conv_summary['total_messages']}")
+        if server_kind == "bedrock":
+            self.bedrock_log_buffer.append(
+                f"[Prefect] generating_reply server={server_kind} player={player} persona={persona.name} history={conv_summary['total_messages']}"
+            )
+        else:
+            self.log_buffer.append(
+                f"[Prefect] generating_reply server={server_kind} player={player} persona={persona.name} history={conv_summary['total_messages']}"
+            )
         try:
             reply = asyncio.run(self.ollama.generate(
                 system_prompt, 
@@ -553,28 +789,45 @@ class PrefectCore:
         safe = _coerce_safe_chat_text(reply, max_len=int(self.settings.chat_max_reply_length))
         
         # Record Prefect's response in persistent conversation store
-        self.conversation_store.add_prefect_response(player, safe)
+        store.add_prefect_response(player, safe)
 
         # Try to send to server chat.
-        self.log_buffer.append(f"[Prefect] sending_reply_to_chat player={player}")
-        out = self.announce(f"@{player} {safe}")
-        self.log_buffer.append(f"[Prefect] chat_send_result ok={out.get('ok')} sent={out.get('sent')} err={out.get('error')}")
+        if server_kind == "bedrock":
+            self.bedrock_log_buffer.append(f"[Prefect] sending_reply_to_chat server={server_kind} player={player}")
+        else:
+            self.log_buffer.append(f"[Prefect] sending_reply_to_chat server={server_kind} player={player}")
+
+        out = announce_fn(f"@{player} {safe}")
+        if server_kind == "bedrock":
+            self.bedrock_log_buffer.append(
+                f"[Prefect] chat_send_result ok={out.get('ok')} sent={out.get('sent')} err={out.get('error')}"
+            )
+        else:
+            self.log_buffer.append(
+                f"[Prefect] chat_send_result ok={out.get('ok')} sent={out.get('sent')} err={out.get('error')}"
+            )
         if not out.get("ok"):
             # If announce failed, check if server is offline.
             # If so, we should still show the reply in the GUI log (local chat).
-            if not self.controller.status().running:
+            if not controller.status().running:
                 self._on_chat_line("Prefect", f"@{player} {safe}")
                 return
 
             # Last resort: strip harder and try again.
             safe2 = _coerce_safe_chat_text(safe, max_len=int(self.settings.chat_max_reply_length)).replace("(", "").replace(")", "")
-            out2 = self.announce(f"@{player} {safe2}")
-            self.log_buffer.append(
-                f"[Prefect] chat_send_retry ok={out2.get('ok')} sent={out2.get('sent')} err={out2.get('error')}"
-            )
+            out2 = announce_fn(f"@{player} {safe2}")
+            if server_kind == "bedrock":
+                self.bedrock_log_buffer.append(
+                    f"[Prefect] chat_send_retry ok={out2.get('ok')} sent={out2.get('sent')} err={out2.get('error')}"
+                )
+            else:
+                self.log_buffer.append(
+                    f"[Prefect] chat_send_retry ok={out2.get('ok')} sent={out2.get('sent')} err={out2.get('error')}"
+                )
 
     def get_status(self) -> dict:
         st = self.controller.status()
+        external = self._detect_external_necesse()
         port_open = None
         if self.settings.game_port is not None:
             # Use a short timeout to avoid blocking the UI thread for too long
@@ -586,7 +839,103 @@ class PrefectCore:
             "game_host": self.settings.game_host,
             "game_port": self.settings.game_port,
             "game_port_open": port_open,
+            "external_running": external["running"],
+            "external_pids": external["pids"],
         }
+
+    def get_bedrock_status(self) -> dict:
+        bedrock_mode = (self.settings.bedrock_control_mode or "managed").lower()
+        if bedrock_mode == "tmux":
+            # In tmux mode we don't own stdout, so make sure our log tailer is running
+            # and (if the session exists) ensure tmux output is being piped into the log.
+            try:
+                self.bedrock_process_manager.start_log_tailing()
+            except Exception:
+                pass
+
+            try:
+                if self.bedrock_controller.status().running:
+                    # start() is idempotent: with an existing session it only ensures pipe-pane.
+                    self.bedrock_controller.start()
+            except Exception:
+                pass
+
+        st = self.bedrock_controller.status()
+        external = self._detect_external_bedrock()
+        return {
+            **asdict(st),
+            "prefect_uptime_seconds": max(0.0, time.time() - self._start_time),
+            "log_buffer_lines": len(self.bedrock_log_buffer.get_recent(self.settings.log_buffer_lines)),
+            "external_running": external["running"],
+            "external_pids": external["pids"],
+        }
+
+    def _detect_external_necesse(self) -> dict:
+        """Best-effort detection of a Necesse server not started by this Prefect instance."""
+        # If we're attached via tmux, treat status() as authoritative.
+        if (self.settings.control_mode or "managed").lower() == "tmux":
+            return {"running": False, "pids": []}
+
+        root = self.settings.server_root
+        pids: list[int] = []
+        try:
+            # Match Java Server.jar process.
+            out = subprocess.run(
+                ["pgrep", "-f", "Server\\.jar"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            for tok in (out.stdout or "").split():
+                try:
+                    pid = int(tok)
+                except Exception:
+                    continue
+                # Best-effort: ensure the process is running from the expected server_root.
+                try:
+                    cwd = Path(f"/proc/{pid}/cwd").resolve()
+                    if str(cwd).startswith(str(root)):
+                        pids.append(pid)
+                except Exception:
+                    # If we can't resolve cwd, still count it.
+                    pids.append(pid)
+        except Exception:
+            return {"running": False, "pids": []}
+
+        pids = sorted(set(pids))
+        return {"running": bool(pids), "pids": pids}
+
+    def _detect_external_bedrock(self) -> dict:
+        """Best-effort detection of a Bedrock server not started by this Prefect instance."""
+        # If we're attached via tmux, treat status() as authoritative.
+        if (self.settings.bedrock_control_mode or "managed").lower() == "tmux":
+            return {"running": False, "pids": []}
+
+        root = self.settings.bedrock_server_root
+        pids: list[int] = []
+        try:
+            out = subprocess.run(
+                ["pgrep", "-x", "bedrock_server"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            for tok in (out.stdout or "").split():
+                try:
+                    pid = int(tok)
+                except Exception:
+                    continue
+                try:
+                    cwd = Path(f"/proc/{pid}/cwd").resolve()
+                    if str(cwd).startswith(str(root)):
+                        pids.append(pid)
+                except Exception:
+                    pids.append(pid)
+        except Exception:
+            return {"running": False, "pids": []}
+
+        pids = sorted(set(pids))
+        return {"running": bool(pids), "pids": pids}
 
     def get_recent_logs(self, n: int) -> list[str]:
         # Clamp n to avoid huge responses.
@@ -595,6 +944,9 @@ class PrefectCore:
 
     def get_logs_since(self, ts: float) -> list[tuple[float, str]]:
         return self.log_buffer.get_since_with_ts(ts)
+
+    def get_bedrock_logs_since(self, ts: float) -> list[tuple[float, str]]:
+        return self.bedrock_log_buffer.get_since_with_ts(ts)
 
 
     def run_command(self, command: str) -> dict:
@@ -605,9 +957,39 @@ class PrefectCore:
             result = self.command_runner.run(cmd)
             if result.ok:
                 return {"ok": True, "output": result.output}
+            # Hint if the server is likely running outside Prefect.
+            if not self.controller.status().running and self._detect_external_necesse()["running"]:
+                return {
+                    "ok": False,
+                    "error": (result.error or "Command failed")
+                    + " (server appears to be running outside Prefect; use control_mode=tmux to attach)",
+                    "output": result.output,
+                }
             return {"ok": False, "error": result.error or "Command failed", "output": result.output}
 
         except (UnsafeInputError, CommandNotPermittedError) as exc:
+            return {"ok": False, "error": str(exc), "output": ""}
+
+    def run_bedrock_command(self, command: str) -> dict:
+        """Run a Bedrock console command (stdin to the server), returning a small log window."""
+        try:
+            cmd = sanitize_command(command, max_length=self.settings.max_command_length)
+            result = self.bedrock_command_runner.run(cmd)
+            if result.ok:
+                return {"ok": True, "output": result.output}
+            if (
+                (self.settings.bedrock_control_mode or "managed").lower() != "tmux"
+                and not self.bedrock_controller.status().running
+                and self._detect_external_bedrock()["running"]
+            ):
+                return {
+                    "ok": False,
+                    "error": (result.error or "Command failed")
+                    + " (server appears to be running outside Prefect; set bedrock_control_mode=tmux to attach)",
+                    "output": result.output,
+                }
+            return {"ok": False, "error": result.error or "Command failed", "output": result.output}
+        except UnsafeInputError as exc:
             return {"ok": False, "error": str(exc), "output": ""}
 
     def announce(self, message: str) -> dict:
@@ -644,6 +1026,35 @@ class PrefectCore:
 
         self.log_buffer.append(f"[Prefect] announce_failed (not sent): err={last_err} out={str(last_out)[:120]}")
         return {"ok": False, "sent": False, "error": last_err or "Unable to post message to server chat"}
+
+    def bedrock_announce(self, message: str) -> dict:
+        """Post a message into Bedrock in-game chat using console commands."""
+        try:
+            msg = sanitize_announce(message, max_length=self.settings.max_announce_length)
+        except UnsafeInputError as exc:
+            return {"ok": False, "sent": False, "error": str(exc)}
+
+        templates = [
+            t.strip() for t in (self.settings.bedrock_announce_command_templates or "").split(",") if t.strip()
+        ]
+        if not templates:
+            templates = ["say {message}"]
+
+        last_err: str | None = None
+        last_out: str | None = None
+
+        for tmpl in templates:
+            cmd = tmpl.replace("{message}", msg)
+            resp = self.run_bedrock_command(cmd)
+            last_out = resp.get("output", "")
+            if resp.get("ok"):
+                return {"ok": True, "sent": True}
+            last_err = resp.get("error") or last_err
+
+        self.bedrock_log_buffer.append(
+            f"[Prefect] bedrock_announce_failed (not sent): err={last_err} out={str(last_out)[:120]}"
+        )
+        return {"ok": False, "sent": False, "error": last_err or "Unable to post message to Bedrock chat"}
 
     def send_chat_message(self, message: str, origin: str = "Admin") -> dict:
         """Send a chat message. If server is running, announce it. If not, treat as local chat."""

@@ -18,6 +18,7 @@ class TestPrefectSettings:
         assert settings.ollama_url == "http://127.0.0.1:11434"
         assert settings.model == "llama3.1"
         assert settings.control_mode == "managed"
+        assert settings.bedrock_control_mode == "tmux"
         assert settings.mcp_transport == "stdio"
         assert settings.chat_mention_enabled is True
 
